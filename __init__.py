@@ -1,3 +1,13 @@
+bl_info = {
+    "name": "Star Wars Outlaws Mesh Tool",
+    "author": "AlexPo",
+    "location": "Scene Properties > Star Wars: Outlaws Mesh Tool Panel",
+    "version": (0, 0, 1),
+    "blender": (4, 2, 0),
+    "description": "This addon imports/exports skeletal meshes\n from Star Wars Outlaws's .mmb files",
+    "category": "Import-Export"
+    }
+
 import bpy
 import bmesh
 from struct import unpack, pack
@@ -5,9 +15,9 @@ import numpy as np
 import math
 from mathutils import Matrix, Euler, Vector
 from pathlib import Path
+import os
+import io
 
-file_path = "W:\OutlawsModding\helix\\baked\\art\characters\characters\chr_body\chr_body_1_gold_kay\chr_body_1_gold_kay-combined.mmb_0"
-file_path = Path(file_path)
 
 class ByteReader:
     @staticmethod
@@ -169,7 +179,6 @@ class ByteReader:
         # print(Matrix((row1,row2,row3,row4)))
         matrix = Matrix((row1, row2, row3, row4))#.inverted()
         return matrix
-
 class BytePacker:
     @staticmethod
     def int8(v):
@@ -266,6 +275,22 @@ def CopyFile(read,write,offset,size,buffer_size=500000):
     for o in range(chunks):
         write.write(read.read(buffer_size))
     write.write(read.read(size%buffer_size))
+def get_merged_mmb(mmb):
+    files = []
+    i = 0
+    while True:
+        current_file = f"{str(mmb)[:-1]}{i}"
+        if os.path.isfile(current_file):
+            files.append(current_file)
+            i += 1
+        else:
+            break
+
+    f = io.BytesIO()
+    for file_dir in files:
+        with open(file_dir, 'rb') as file:
+            f.write(file.read())
+    return f
 
 class Asset:
     def __init__(self):
@@ -281,7 +306,9 @@ class Asset:
 class SkeletalMeshAsset(Asset):
     class Mesh:
         class LOD:
-            def __init__(self):
+            def __init__(self, parent_mesh,index):
+                self.parent_mesh:SkeletalMeshAsset.Mesh = parent_mesh
+                self.index = index
                 self.vertex_count = 0
                 self.index_count = 0
                 self.vertex_data_offset_a = 0
@@ -302,25 +329,28 @@ class SkeletalMeshAsset(Asset):
 
             def get_vertex_positions(self,raw_mesh_file):
                 vertices = []
-                with open(raw_mesh_file,'rb') as f:
-                    f.seek(self.vertex_data_offset_a)
-                    for v in range(self.vertex_count):
+                stride = self.parent_mesh.vertex_stride
+                f = raw_mesh_file
+                f.seek(self.vertex_data_offset_a)
+                for v in range(self.vertex_count):
                         x = br.int16_norm(f)
                         y = br.int16_norm(f)
                         z = br.int16_norm(f)
                         w = br.int16(f)
                         pos = (x*w,y*w,z*w)
-                        f.seek(16,1) #TODO get real stride from Mesh parent class
+                        f.seek(stride - 8 ,1)
                         vertices.append(pos)
                 return vertices
 
             def get_bone_weights(self, raw_mesh_file):
                 bone_weights = []
-                with open(raw_mesh_file, 'rb') as f:
-                    f.seek(self.vertex_data_offset_a)
-                    for v in range(self.vertex_count):
+                stride = self.parent_mesh.vertex_stride
+                f = raw_mesh_file
+                f.seek(self.vertex_data_offset_a)
+                for v in range(self.vertex_count):
                         f.seek(8, 1)  # skip positions
-                        weight_count = 8  # TODO get real index count from stride
+
+                        weight_count = int((stride - 8) / 2)
                         weights = []
                         iw = {}
                         for w in range(weight_count):
@@ -344,9 +374,9 @@ class SkeletalMeshAsset(Asset):
                 :return: a List of Tuples containing 3 vertex indices to form a triangle.
                 """
                 tris = []
-                with open(raw_mesh_file, 'rb') as f:
-                    f.seek(self.face_block_offset)
-                    for i in range(int(self.index_count/3)):
+                f = raw_mesh_file
+                f.seek(self.face_block_offset)
+                for i in range(int(self.index_count/3)):
                         f1 = br.uint16(f)
                         f2 = br.uint16(f)
                         f3 = br.uint16(f)
@@ -355,16 +385,17 @@ class SkeletalMeshAsset(Asset):
 
             def get_normals(self,raw_mesh_file):
                 normals = []
-                with open(raw_mesh_file, 'rb') as f:
-                    f.seek(self.vertex_data_offset_b)
-                    for i in range(self.vertex_count):
+                stride = self.parent_mesh.normals_stride
+                f = raw_mesh_file
+                f.seek(self.vertex_data_offset_b)
+                for i in range(self.vertex_count):
                         x = br.int8_norm(f) *-1
                         y = br.int8_norm(f)
                         z = br.int8_norm(f)
                         w = br.int8(f)
                         v = Vector((x*w, y*w, z*w)).normalized()
                         v.negate() #TODO not sure about this
-                        f.seek(12,1)
+                        f.seek(stride - 4,1)
                         normals.append(v)
                 return normals
 
@@ -375,10 +406,11 @@ class SkeletalMeshAsset(Asset):
                 :return: a List of Tuples containing 2 floats as UV coordinates.
                 """
                 uvs = []
-                with open(raw_mesh_file, 'rb') as f:
-                    f.seek(self.vertex_data_offset_b)
-                    for i in range(self.vertex_count):
-                        f.seek(12,1) #skip normals and color #TODO find real value
+                stride = self.parent_mesh.normals_stride
+                f = raw_mesh_file
+                f.seek(self.vertex_data_offset_b)
+                for i in range(self.vertex_count):
+                        f.seek(stride - 4,1)
                         u = br.int16_norm(f)
                         v = br.int16_norm(f)
                         uvs.append((u,v))
@@ -391,10 +423,11 @@ class SkeletalMeshAsset(Asset):
                :return: a List of Tuples containing 4 floats as RGBA coordinates.
                """
                 colors = []
-                with open(raw_mesh_file, 'rb') as f:
-                    f.seek(self.vertex_data_offset_b)
-                    for i in range(self.vertex_count):
-                        f.seek(8, 1)  # skip normals #TODO find real value
+                stride = self.parent_mesh.normals_stride
+                f = raw_mesh_file
+                f.seek(self.vertex_data_offset_b)
+                for i in range(self.vertex_count):
+                        f.seek(8, 1)  # skip normals
                         r = br.uint8_norm(f)
                         g = br.uint8_norm(f)
                         b = br.uint8_norm(f)
@@ -403,7 +436,8 @@ class SkeletalMeshAsset(Asset):
                         colors.append((r,g,b,a))
                 return colors
 
-        def __init__(self):
+        def __init__(self,parent_sk_mesh):
+            self.parent_sk_mesh:SkeletalMeshAsset = parent_sk_mesh
             self.name = ""
             self.lod_count = 0
             self.lods = []
@@ -428,15 +462,25 @@ class SkeletalMeshAsset(Asset):
             self.lod_count = br.uint8(f)
             f.seek(4, 1)
             for l in range(self.lod_count):
-                lod = self.LOD()
+                lod = self.LOD(self,l)
                 lod.parse(f)
                 if lod_info_type == 2:
                     f.seek(28,
                            1)  # if lod_info_type = 2 there's more data, this should be handled by the LOD.parse function.
                 self.lods.append(lod)
-            f.seek(19, 1)  # this is specific to chr_body_1_gold_kay.mmb_0 for now #TODO figure out between lods and strides
+
+            #this section could be wrong
+            count_a = br.uint8(f)
+            f.seek(4*count_a,1)
+            count_b = br.uint8(f)
+            f.seek(4*count_b,1)
+            unk = br.uint32(f)
+            count_c = br.uint8(f)
+            f.seek(4*count_c,1)
+
             self.vertex_stride = br.uint16(f)
             self.normals_stride = br.uint16(f)
+            print(self.vertex_stride,self.normals_stride)
             f.seek(20, 1)  # TODO figure out between strides and next mesh
         def extract_mesh_file(self,f):
             """
@@ -445,13 +489,11 @@ class SkeletalMeshAsset(Asset):
             :param f: combined mmb file that contains the header and data.
             :return: Path to the extracted raw_mesh file.
             """
-            extract_file = Path.joinpath(file_path.parent, file_path.stem + "_-_" + self.name + ".raw_mesh")
-            with open(extract_file, "wb+") as w:
-                print(f"created {extract_file}")
-                for lod in reversed(self.lods):
-                    print(f'Copy at {lod.data_offset} size {lod.data_size}')
-                    CopyFile(f, w, lod.data_offset, lod.data_size)
-                print(f'Total size: {sum(lod.data_size for lod in self.lods)}')
+            extract_file = io.BytesIO()
+            for lod in reversed(self.lods):
+                # print(f'Copy at {lod.data_offset} size {lod.data_size}')
+                CopyFile(f, extract_file, lod.data_offset, lod.data_size)
+            # print(f'Total size: {sum(lod.data_size for lod in self.lods)}')
             return extract_file
 
     class Bone:
@@ -462,6 +504,7 @@ class SkeletalMeshAsset(Asset):
 
     def __init__(self):
         super().__init__()
+        self.name = ""
         self.bone_count = 0
         self.bones = []
         self.mesh_count = 0
@@ -471,24 +514,36 @@ class SkeletalMeshAsset(Asset):
         self.bone_count = br.uint32(f)
         for b in range(self.bone_count):
             self.bones.append(self.Bone(f))
+        self.name = self.bones[0].name
         self.mesh_count = br.uint32(f)
         for m in range(self.mesh_count):
-            mesh = self.Mesh()
+            mesh = self.Mesh(self)
             mesh.parse(f)
             self.meshes.append(mesh)
 
 class BlenderMeshImporter:
+    @staticmethod
+    def find_or_create_collection(name):
+        index = bpy.data.collections.find(name)
+        if index != -1:
+            return bpy.data.collections[index]
+        else:
+            collection = bpy.data.collections.new(name)
+            bpy.context.scene.collection.children.link(collection)
+            return collection
+
+
     @staticmethod
     def import_mesh(file, skeletal_mesh:SkeletalMeshAsset, mesh:SkeletalMeshAsset.Mesh, lod_index = 0):
         # Extract raw mesh file
         raw_mesh_file = mesh.extract_mesh_file(file)
 
         # Create Mesh and Object
-        obj_data = bpy.data.meshes.new(mesh.name)
-        obj = bpy.data.objects.new(mesh.name, obj_data)
-        new_collection = bpy.data.collections.new(skeletal_mesh.bones[0].name) #TODO search for existing collection first
-        bpy.context.scene.collection.children.link(new_collection)
-        new_collection.objects.link(obj)
+        obj_name = f'{mesh.name}_LOD{lod_index}'
+        obj_data = bpy.data.meshes.new(obj_name)
+        obj = bpy.data.objects.new(obj_name, obj_data)
+        collection = BMI.find_or_create_collection(skeletal_mesh.name)
+        collection.objects.link(obj)
 
         # Create BMesh
         bm = bmesh.new()
@@ -540,7 +595,7 @@ class BlenderMeshImporter:
         # Import Bone Weights
         weights = lod.get_bone_weights(raw_mesh_file)
         mesh_bones = list(mesh.mesh_bones.keys())
-        for bone in sk_mesh.bones:
+        for bone in skeletal_mesh.bones:
             obj.vertex_groups.new(name=bone.name)
         for v_index in range(lod.vertex_count):
             v_bone_weights = weights[v_index]
@@ -552,10 +607,19 @@ class BlenderMeshImporter:
         return obj
 
     @staticmethod
+    def find_or_create_skeleton(skeletal_mesh:SkeletalMeshAsset):
+        index = bpy.data.objects.find(skeletal_mesh.name)
+        if index != -1:
+            return bpy.data.objects[index]
+        else:
+            return BMI.import_skeleton(skeletal_mesh)
+
+    @staticmethod
     def import_skeleton(skeletal_mesh:SkeletalMeshAsset):
-        _armature = bpy.data.armatures.new("armature_data")
-        _obj = bpy.data.objects.new("Armature", _armature)
-        bpy.context.scene.collection.objects.link(_obj) #TODO find existing collection
+        _armature = bpy.data.armatures.new(skeletal_mesh.name)
+        _obj = bpy.data.objects.new(skeletal_mesh.name, _armature)
+        collection = BMI.find_or_create_collection(skeletal_mesh.name)
+        collection.objects.link(_obj)
         bpy.context.view_layer.objects.active = _obj
         bpy.ops.object.mode_set(mode='EDIT')
         for i,b in enumerate(skeletal_mesh.bones):
@@ -588,12 +652,125 @@ class BlenderMeshImporter:
         bpy.ops.object.transform_apply(rotation=True)
 
 #testing
-with open(file_path, 'rb') as file:
-    print(f"opened : {file_path}")
-    sk_mesh = SkeletalMeshAsset()
-    sk_mesh.parse(file)
-    BMI = BlenderMeshImporter
-    obj = BMI.import_mesh(file, sk_mesh, sk_mesh.meshes[0], 0)
-    armature = BMI.import_skeleton(sk_mesh)
-    BMI.parent_obj_to_armature(obj,armature)
-    BMI.rotate_model(obj,armature)
+# file_path = "W:\OutlawsModding\helix\\baked\\art\characters\characters\chr_body\chr_body_1_gold_kay\chr_body_1_gold_kay-combined.mmb_0"
+# file_path = Path(file_path)
+# with open(file_path, 'rb') as file:
+#     print(f"opened : {file_path}")
+#     sk_mesh = SkeletalMeshAsset()
+#     sk_mesh.parse(file)
+#     BMI = BlenderMeshImporter
+#     obj = BMI.import_mesh(file, sk_mesh, sk_mesh.meshes[0], 0)
+#     armature = BMI.import_skeleton(sk_mesh)
+#     BMI.parent_obj_to_armature(obj,armature)
+#     BMI.rotate_model(obj,armature)
+
+asset : SkeletalMeshAsset = None
+BMI = BlenderMeshImporter
+
+class SWOMTSettings(bpy.types.PropertyGroup):
+    AssetPath: bpy.props.StringProperty(name="Asset Path", subtype="FILE_PATH")
+
+# OPERATORS #
+class LoadMMB(bpy.types.Operator):
+    """Reads data from base .mmb file"""
+    bl_idname = "object.load_mmb"
+    bl_label = "Load"
+
+    def execute(self,context):
+        SWOMT = context.scene.SWOMT
+        with open(SWOMT.AssetPath, 'rb') as file:
+            sk_mesh = SkeletalMeshAsset()
+            sk_mesh.parse(file)
+            global asset
+            asset = sk_mesh
+
+        return {'FINISHED'}
+
+class ImportLOD(bpy.types.Operator):
+    """Imports the given LOD"""
+    bl_idname = 'object.import_lod'
+    bl_label = 'Import'
+
+    mesh_index: bpy.props.IntProperty()
+    lod_index: bpy.props.IntProperty()
+
+    @classmethod
+    def poll(cls,context):
+        return asset is not None
+
+    def execute(self,context):
+        sk_mesh = asset
+        mesh = sk_mesh.meshes[self.mesh_index]
+        lod = mesh.lods[self.lod_index]
+        SWOMT = context.scene.SWOMT
+        merged_mmb = get_merged_mmb(SWOMT["AssetPath"])
+        obj = BMI.import_mesh(merged_mmb,
+                              skeletal_mesh=sk_mesh,
+                              mesh=mesh,
+                              lod_index=lod.index)
+        armature = BMI.find_or_create_skeleton(sk_mesh)
+        BMI.parent_obj_to_armature(obj,armature)
+        BMI.rotate_model(obj,armature)
+        return {'FINISHED'}
+
+# PANELS #
+class SWOMTPanel(bpy.types.Panel):
+    """Creates a Panel in the Scene Properties window"""
+    bl_label = "Star Wars: Outlaws Mesh Tool"
+    bl_idname = "OBJECT_PT_swomtpanel"
+    bl_space_type = "PROPERTIES"
+    bl_region_type = "WINDOW"
+    bl_context = "scene"
+
+
+    def draw(self,context):
+        SWOMT = context.scene.SWOMT
+
+        layout = self.layout
+        row = layout.row()
+        row.prop(SWOMT, "AssetPath")
+        layout.row().operator("object.load_mmb")
+
+class MeshPanel(bpy.types.Panel):
+    bl_label = "Mesh"
+    bl_idname = "OBJECT_PT_meshpanel"
+    bl_space_type = "PROPERTIES"
+    bl_region_type = "WINDOW"
+    bl_context = "scene"
+    bl_parent_id = "OBJECT_PT_swomtpanel"
+
+    def draw(self,context):
+        SWOMT = context.scene.SWOMT
+
+        layout = self.layout
+        row = layout.row()
+        if asset:
+            row.label(text=asset.name)
+            for mi, m in enumerate(asset.meshes):
+                mesh_row = layout.row()
+                mesh_box = mesh_row.box()
+                mesh_box.label(text = m.name, icon = "MESH_ICOSPHERE")
+                for li,l in enumerate(m.lods):
+                    row = mesh_box.row()
+                    row.label(text = f"LOD{li} - {l.vertex_count}", icon = "CON_SIZELIKE")
+                    lod_import_button = row.operator("object.import_lod")
+                    lod_import_button.lod_index = li
+                    lod_import_button.mesh_index = mi
+
+classes=[SWOMTSettings,
+         SWOMTPanel,
+         MeshPanel,
+         LoadMMB,
+         ImportLOD]
+
+def register():
+    for c in classes:
+        bpy.utils.register_class(c)
+    bpy.types.Scene.SWOMT = bpy.props.PointerProperty(type=SWOMTSettings)
+
+def unregister():
+    for c in classes:
+        bpy.utils.unregister_class(c)
+
+if __name__ == "__main__":
+    register()
