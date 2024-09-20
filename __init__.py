@@ -2,7 +2,7 @@ bl_info = {
     "name": "Star Wars Outlaws Mesh Tool",
     "author": "AlexPo",
     "location": "Scene Properties > Star Wars: Outlaws Mesh Tool Panel",
-    "version": (0, 0, 1),
+    "version": (0, 0, 2),
     "blender": (4, 2, 0),
     "description": "This addon imports/exports skeletal meshes\n from Star Wars Outlaws's .mmb files",
     "category": "Import-Export"
@@ -332,39 +332,53 @@ class SkeletalMeshAsset(Asset):
                 stride = self.parent_mesh.vertex_stride
                 f = raw_mesh_file
                 f.seek(self.vertex_data_offset_a)
+                pos = (0.0,0.0,0.0)
                 for v in range(self.vertex_count):
+                    stride_start = f.tell()
+                    if self.parent_mesh.position_type == 0:
                         x = br.int16_norm(f)
                         y = br.int16_norm(f)
                         z = br.int16_norm(f)
                         w = br.int16(f)
                         pos = (x*w,y*w,z*w)
-                        f.seek(stride - 8 ,1)
-                        vertices.append(pos)
+                    elif self.parent_mesh.position_type == 1:
+                        x = br.float(f)
+                        y = br.float(f)
+                        z = br.float(f)
+                        pos = (x,y,z)
+                    f.seek(stride_start + stride)
+                    vertices.append(pos)
                 return vertices
 
             def get_bone_weights(self, raw_mesh_file):
                 bone_weights = []
                 stride = self.parent_mesh.vertex_stride
+                pos_length = 0 #size of vertex position in stride
                 f = raw_mesh_file
                 f.seek(self.vertex_data_offset_a)
                 for v in range(self.vertex_count):
-                        f.seek(8, 1)  # skip positions
+                    if stride == 24:
+                        pos_length = 8
+                    elif stride == 28:
+                        pos_length = 12
+                    else:
+                        pos_length = 8
+                    f.seek(pos_length,1)
+                    weight_count = int((stride - pos_length) / 2)
+                    weights = []
+                    iw = {}
+                    for w in range(weight_count):
+                        weight = br.uint8_norm(f)
+                        if weight > 0.0:
+                            weights.append(weight)
 
-                        weight_count = int((stride - 8) / 2)
-                        weights = []
-                        iw = {}
-                        for w in range(weight_count):
-                            weight = br.uint8_norm(f)
-                            if weight > 0.0:
-                                weights.append(weight)
+                    for i in range(weight_count):
+                        if i < len(weights):
+                            iw[br.uint8(f)] = weights[i]
+                        else:
+                            f.seek(1,1)
 
-                        for i in range(weight_count):
-                            if i < len(weights):
-                                iw[br.uint8(f)] = weights[i]
-                            else:
-                                f.seek(1,1)
-
-                        bone_weights.append(iw)
+                    bone_weights.append(iw)
                 return bone_weights
 
             def get_triangles(self,raw_mesh_file):
@@ -383,23 +397,37 @@ class SkeletalMeshAsset(Asset):
                         tris.append((f1,f2,f3))
                 return tris
 
+            def get_normals_size(self):
+                if self.parent_mesh.normal_type == 0:
+                    return 8
+                else:
+                    return 28
+
             def get_normals(self,raw_mesh_file):
                 normals = []
                 stride = self.parent_mesh.normals_stride
                 f = raw_mesh_file
                 f.seek(self.vertex_data_offset_b)
+                v = Vector((0.0,0.0,1.0))
                 for i in range(self.vertex_count):
+                    stride_start = f.tell()
+                    if self.parent_mesh.normal_type == 0:
                         x = br.int8_norm(f) *-1
                         y = br.int8_norm(f)
                         z = br.int8_norm(f)
                         w = br.int8(f)
                         v = Vector((x*w, y*w, z*w)).normalized()
-                        v.negate() #TODO not sure about this
-                        f.seek(stride - 4,1)
-                        normals.append(v)
+                        v.negate()  # TODO not sure about this
+                    elif self.parent_mesh.normal_type == 1:
+                        x = br.float(f) *-1
+                        y = br.float(f)
+                        z = br.float(f)
+                        v = Vector((x,y,z)).normalized()
+                    f.seek(stride_start + stride)
+                    normals.append(v)
                 return normals
 
-            def get_uvs(self,raw_mesh_file):
+            def get_uvs(self,raw_mesh_file, index=0):
                 """
                 Seeks to Lod.vertex_data_offset_b and reads all UV data.
                 :param raw_mesh_file: file that is exported by SkeletalMeshAsset.Mesh.extract_mesh_file()
@@ -407,16 +435,21 @@ class SkeletalMeshAsset(Asset):
                 """
                 uvs = []
                 stride = self.parent_mesh.normals_stride
+                color_count = self.parent_mesh.color_count
                 f = raw_mesh_file
                 f.seek(self.vertex_data_offset_b)
                 for i in range(self.vertex_count):
-                        f.seek(stride - 4,1)
-                        u = br.int16_norm(f)
-                        v = br.int16_norm(f)
-                        uvs.append((u,v))
+                    stride_start = f.tell()
+                    f.seek(self.get_normals_size(), 1) #skip normals
+                    f.seek(4 * color_count, 1) #skip color
+                    f.seek(index * 4, 1)  # skip previous uv
+                    u = br.int16_norm(f)
+                    v = br.int16_norm(f)
+                    f.seek(stride_start + stride)
+                    uvs.append((u,v))
                 return uvs
 
-            def get_color(self,raw_mesh_file):
+            def get_color(self,raw_mesh_file, index=0):
                 """
                Seeks to Lod.vertex_data_offset_b and reads all Color data.
                :param raw_mesh_file: file that is exported by SkeletalMeshAsset.Mesh.extract_mesh_file()
@@ -427,13 +460,15 @@ class SkeletalMeshAsset(Asset):
                 f = raw_mesh_file
                 f.seek(self.vertex_data_offset_b)
                 for i in range(self.vertex_count):
-                        f.seek(8, 1)  # skip normals
-                        r = br.uint8_norm(f)
-                        g = br.uint8_norm(f)
-                        b = br.uint8_norm(f)
-                        a = br.uint8_norm(f)
-                        f.seek(4,1) # skip uvs
-                        colors.append((r,g,b,a))
+                    stride_start = f.tell()
+                    f.seek(self.get_normals_size(), 1) #skip normals
+                    f.seek(index * 4, 1) #skip previous color
+                    r = br.uint8_norm(f)
+                    g = br.uint8_norm(f)
+                    b = br.uint8_norm(f)
+                    a = br.uint8_norm(f)
+                    f.seek(stride_start + stride)
+                    colors.append((r,g,b,a))
                 return colors
 
         def __init__(self,parent_sk_mesh):
@@ -444,6 +479,10 @@ class SkeletalMeshAsset(Asset):
             self.vertex_stride = 0
             self.normals_stride = 0
             self.mesh_bones = {}
+            self.color_count = 0
+            self.uv_count = 0
+            self.normal_type = 0 # 0:int8_norm 1:floats
+            self.position_type = 0 # 0:int16_norm 1:floats
         def parse(self, f):
             self.name = br.name(f)
             f.seek(48, 1)  # some kind of matrix
@@ -470,17 +509,33 @@ class SkeletalMeshAsset(Asset):
                 self.lods.append(lod)
 
             #this section could be wrong
-            count_a = br.uint8(f)
-            f.seek(4*count_a,1)
-            count_b = br.uint8(f)
-            f.seek(4*count_b,1)
+            self.uv_count = br.uint8(f)
+            f.seek(4*self.uv_count,1)
+            self.color_count = br.uint8(f)
+            f.seek(4*self.color_count,1)
             unk = br.uint32(f)
             count_c = br.uint8(f)
             f.seek(4*count_c,1)
 
             self.vertex_stride = br.uint16(f)
             self.normals_stride = br.uint16(f)
-            print(self.vertex_stride,self.normals_stride)
+
+            # guessing the type of normal data int8 or floats
+            if self.normals_stride - (4 * self.uv_count) - (4 * self.color_count) > 8:
+                self.normal_type = 1
+            else:
+                self.normal_type = 0
+
+            # guessing the type of vertex position data int16 or floats
+            if self.vertex_stride - 16 == 8 or self.vertex_stride - 8 == 8:
+                self.position_type = 0 #int16
+            elif self.vertex_stride - 16 == 12 or self.vertex_stride - 8 == 12:
+                self.position_type = 1 #float
+            print(f'\nName = {self.name}'
+                  f'\nVertex Stride: {self.vertex_stride}'
+                  f'\nNormals Stride: {self.normals_stride}'
+                  f'\nUV Count: {self.uv_count}'
+                  f'\nColor Count: {self.color_count}')
             f.seek(20, 1)  # TODO figure out between strides and next mesh
         def extract_mesh_file(self,f):
             """
@@ -514,7 +569,6 @@ class SkeletalMeshAsset(Asset):
         self.bone_count = br.uint32(f)
         for b in range(self.bone_count):
             self.bones.append(self.Bone(f))
-        self.name = self.bones[0].name
         self.mesh_count = br.uint32(f)
         for m in range(self.mesh_count):
             mesh = self.Mesh(self)
@@ -572,19 +626,21 @@ class BlenderMeshImporter:
         bm.from_mesh(obj_data)
         bm.faces.ensure_lookup_table()
         # Import UVs
-        uvs = lod.get_uvs(raw_mesh_file)
-        uv_layer = bm.loops.layers.uv.new("UVMap")
-        for finder, face in enumerate(bm.faces):
-            for lindex, loop in enumerate(face.loops):
-                v_index = loop.vert.index
-                v_uv = (uvs[v_index][0],uvs[v_index][1]*-1+1)
-                loop[uv_layer].uv = v_uv
+        for uv_index in range(mesh.uv_count):
+            uvs = lod.get_uvs(raw_mesh_file,uv_index)
+            uv_layer = bm.loops.layers.uv.new(f'UVMap_{uv_index}')
+            for finder, face in enumerate(bm.faces):
+                for lindex, loop in enumerate(face.loops):
+                    v_index = loop.vert.index
+                    v_uv = (uvs[v_index][0],uvs[v_index][1]*-1+1)
+                    loop[uv_layer].uv = v_uv
 
         # Import Colors
-        colors = lod.get_color(raw_mesh_file)
-        color_layer = bm.verts.layers.float_color.new("Color")
-        for v in bm.verts:
-            v[color_layer] = colors[v.index]
+        for color_index in range(mesh.color_count):
+            colors = lod.get_color(raw_mesh_file, color_index)
+            color_layer = bm.verts.layers.float_color.new(f"Color_{color_index}")
+            for v in bm.verts:
+                v[color_layer] = colors[v.index]
         bm.to_mesh(obj_data)
         bm.free()
         obj_data.update()
@@ -681,6 +737,7 @@ class LoadMMB(bpy.types.Operator):
         with open(SWOMT.AssetPath, 'rb') as file:
             sk_mesh = SkeletalMeshAsset()
             sk_mesh.parse(file)
+            sk_mesh.name = Path(SWOMT.AssetPath).stem
             global asset
             asset = sk_mesh
 
