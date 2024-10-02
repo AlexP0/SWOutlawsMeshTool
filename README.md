@@ -1,1 +1,15 @@
-Currently only able to import helix\baked\art\characters\characters\chr_body\chr_body_1_gold_kay\chr_body_1_gold_kay as a merged file (.mmb_0 with .mmb_1 appended)
+Currently can only import meshes, no export yet.
+
+**Installation**
+- Click the green <> Code button and Download as Zip
+- In Blender, open Preferences
+- go to Add-ons
+- Click the little downward arrow top-right corner
+- Install from Disk...
+- Select the .zip file you downloaded.
+
+**Usage**
+- Find the Star Wars: Outlaws Mesh Tool panel in the Scene Properties tab (the little cone and spheres)
+- Select an .mmb asset (must be either .mmb or .mmb_0)
+- Click Load
+- Click Import on the mesh you want
