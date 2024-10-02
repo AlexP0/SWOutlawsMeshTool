@@ -2,7 +2,7 @@ bl_info = {
     "name": "Star Wars Outlaws Mesh Tool",
     "author": "AlexPo",
     "location": "Scene Properties > Star Wars: Outlaws Mesh Tool Panel",
-    "version": (0, 0, 2),
+    "version": (0, 0, 3),
     "blender": (4, 2, 0),
     "description": "This addon imports/exports skeletal meshes\n from Star Wars Outlaws's .mmb files",
     "category": "Import-Export"
@@ -277,14 +277,17 @@ def CopyFile(read,write,offset,size,buffer_size=500000):
     write.write(read.read(size%buffer_size))
 def get_merged_mmb(mmb):
     files = []
-    i = 0
-    while True:
-        current_file = f"{str(mmb)[:-1]}{i}"
-        if os.path.isfile(current_file):
-            files.append(current_file)
-            i += 1
-        else:
-            break
+    if str(mmb).endswith("mmb"):
+        files.append(mmb)
+    else:
+        i = 0
+        while True:
+            current_file = f"{str(mmb)[:-1]}{i}"
+            if os.path.isfile(current_file):
+                files.append(current_file)
+                i += 1
+            else:
+                break
 
     f = io.BytesIO()
     for file_dir in files:
