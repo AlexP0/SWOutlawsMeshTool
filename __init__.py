@@ -1,8 +1,11 @@
+import copy
+import operator
+
 bl_info = {
     "name": "Star Wars Outlaws Mesh Tool",
     "author": "AlexPo",
     "location": "Scene Properties > Star Wars: Outlaws Mesh Tool Panel",
-    "version": (0, 0, 4),
+    "version": (0, 0, 5),
     "blender": (5, 0, 0),
     "description": "This addon imports/exports skeletal meshes\n from Star Wars Outlaws's .mmb files",
     "category": "Import-Export"
@@ -189,7 +192,7 @@ class BytePacker:
     @staticmethod
     def uint8_norm(v):
         if 0.0 <= v <= 1.0:
-            i = int(v * ((2 ** 8)-1))
+            i = max(0,min(int(v * ((2 ** 8)-1)),255))
         else:
             raise Exception("Couldn't normalize value as uint8Norm, "
                             "it wasn't between 0.0 and 1.0. Unknown max value."
@@ -204,12 +207,12 @@ class BytePacker:
     @staticmethod
     def int16_norm(v):
         # print(v)
-        if -1.0 < v < 1.0:
+        if -1.0 <= v <= 1.0:
             # if v >= 0:
             #     v = int(abs(v) * (2 ** 15))
             # else:
             #     v = 2 ** 16 - int(abs(v) * (2 ** 15))
-            v = int(v * (2 ** 15))
+            v = max(min(int(v * (2 ** 15)),32767), -32768)
         else:
             raise Exception("Couldn't normalize value as int16Norm, it wasn't between -1.0 and 1.0. Unknown max value.")
         return pack('<h', v)
@@ -217,6 +220,7 @@ class BytePacker:
     def uint16_norm(v):
         if 0.0 < v < 1.0:
             i = v * (2 ** 16) - 1
+            i = int(i)
         else:
             raise Exception("Couldn't normalize value as uint16Norm, it wasn't between -1.0 and 1.0. Unknown max value.")
         return pack('<H', i)
@@ -307,30 +311,82 @@ class Asset:
         self.version = br.uint8(f)
         self.size = br.uint32(f)
         f.seek(4,1)
+    def write(self,f):
+        f.seek(4)
+        f.write(bp.uint32(self.size))
 
 class SkeletalMeshAsset(Asset):
     class Mesh:
         class LOD:
             def __init__(self, parent_mesh,index):
+                self.start_offset = 0
                 self.parent_mesh:SkeletalMeshAsset.Mesh = parent_mesh
                 self.index = index
                 self.vertex_count = 0
                 self.index_count = 0
+                self.size_a = 0
                 self.vertex_data_offset_a = 0
                 self.vertex_data_offset_b = 0
                 self.face_block_offset = 0
                 self.data_offset = 0
                 self.data_size = 0
+                self.is_header_lod = False
+                self.vertex_end_bytes = None
+                self.normals_end_bytes = None
+                self.faces_end_bytes = None
+
             def parse(self, f):
+                self.start_offset = f.tell()
                 self.vertex_count = br.uint32(f)
                 self.index_count = br.uint32(f)
-                unknown_size = br.uint32(f)
+                self.size_a = br.uint32(f) # seems to be face_block_offset divided by 2
                 self.vertex_data_offset_a = br.uint32(f)
                 self.vertex_data_offset_b = br.uint32(f)
                 self.face_block_offset = br.uint32(f)
                 self.data_offset = br.uint32(f)
                 self.data_size = br.uint32(f)
                 lod_screen_size = br.float(f)  # not confirmed screen size
+                if self.data_offset < self.parent_mesh.parent_sk_mesh.size:
+                    self.is_header_lod = True
+                    print("Lod ", self.index, "is in header.")
+
+            def write(self, f):
+                f.seek(self.start_offset)
+                f.write(bp.uint32(self.vertex_count))
+                f.write(bp.uint32(self.index_count))
+                f.write(bp.uint32(int(self.face_block_offset / 2)))
+                f.write(bp.uint32(self.vertex_data_offset_a))
+                f.write(bp.uint32(self.vertex_data_offset_b))
+                f.write(bp.uint32(self.face_block_offset))
+                f.write(bp.uint32(self.data_offset))
+                f.write(bp.uint32(self.data_size))
+
+            def gather_extra_bytes(self,f):
+                offset = f.tell()
+                f.seek(self.data_offset)
+                real_vertex_size = self.vertex_count * self.parent_mesh.vertex_stride
+                extra_bytes_size = self.vertex_data_offset_b - self.vertex_data_offset_a - real_vertex_size
+                f.seek(real_vertex_size, 1)
+                print(f.tell())
+                self.vertex_end_bytes = f.read(extra_bytes_size)
+                print("Vertex Extra Bytes:",self.vertex_end_bytes)
+
+                real_normals_size = self.vertex_count * self.parent_mesh.normals_stride
+                extra_bytes_size = self.face_block_offset - self.vertex_data_offset_b - real_normals_size
+                f.seek(real_normals_size, 1)
+                print(f.tell())
+                self.normals_end_bytes = f.read(extra_bytes_size)
+                print("Normal Extra Bytes:",self.normals_end_bytes)
+
+                real_face_size = self.index_count * 2
+                size_without_face = self.face_block_offset - self.vertex_data_offset_a
+                extra_bytes_size = self.data_size - size_without_face - real_face_size
+                f.seek(real_face_size, 1)
+                print(f.tell())
+                self.faces_end_bytes = f.read(extra_bytes_size)
+                print("Face Extra Bytes:",self.faces_end_bytes)
+
+                f.seek(offset)
 
             def get_vertex_positions(self,raw_mesh_file):
                 vertices = []
@@ -361,15 +417,16 @@ class SkeletalMeshAsset(Asset):
                 pos_length = 0 #size of vertex position in stride
                 f = raw_mesh_file
                 f.seek(self.vertex_data_offset_a)
+                pos_length = 0
+                if self.parent_mesh.position_type == 0:
+                    pos_length = 8
+                elif self.parent_mesh.position_type == 1:
+                    pos_length = 12
+                else:
+                    pos_length = 12
+                weight_count = int((stride - pos_length) / 2)
                 for v in range(self.vertex_count):
-                    if stride == 24:
-                        pos_length = 8
-                    elif stride == 28:
-                        pos_length = 12
-                    else:
-                        pos_length = 8
                     f.seek(pos_length,1)
-                    weight_count = int((stride - pos_length) / 2)
                     weights = []
                     iw = {}
                     for w in range(weight_count):
@@ -500,18 +557,24 @@ class SkeletalMeshAsset(Asset):
                     f.write(bp.float(z))
                 f.seek(stride_start + stride)
 
-        def __init__(self,parent_sk_mesh):
+        def __init__(self,parent_sk_mesh,index = 0):
             self.parent_sk_mesh:SkeletalMeshAsset = parent_sk_mesh
+            self.index = index
             self.name = ""
+            self.lod_count_offset = 0
             self.lod_count = 0
             self.lods = []
             self.vertex_stride = 0
             self.normals_stride = 0
             self.mesh_bones = {}
+            self.real_bone_indices_to_mesh_bones = {}
             self.color_count = 0
             self.uv_count = 0
             self.normal_type = 0 # 0:int8_norm 1:floats
             self.position_type = 0 # 0:int16_norm 1:floats
+            self.end_bytes = None # bytes from the end of the last LOD to the end of the mesh section.
+            self.mesh_file = None # BytesIO of reversed ordered LOD mesh data.
+
         def parse(self, f):
             self.name = br.name(f)
             f.seek(48, 1)  # some kind of matrix
@@ -525,8 +588,10 @@ class SkeletalMeshAsset(Asset):
                 matrix = br.matrix_4x4(f)
                 bone_index = br.uint16(f)
                 self.mesh_bones[bone_index] = matrix
+                self.real_bone_indices_to_mesh_bones[bone_index] = b
             f.seek(2, 1)
             lod_info_type = br.uint16(f)
+            self.lod_count_offset = f.tell()
             self.lod_count = br.uint8(f)
             f.seek(4, 1)
             for l in range(self.lod_count):
@@ -549,6 +614,11 @@ class SkeletalMeshAsset(Asset):
             self.vertex_stride = br.uint16(f)
             self.normals_stride = br.uint16(f)
 
+            # Gather extra bytes at the end of each LOD's vertex/normal/face data.
+            # Must be done after getting stride lengths.
+            for l in self.lods:
+                l.gather_extra_bytes(f)
+
             # guessing the type of normal data int8 or floats
             if self.normals_stride - (4 * self.uv_count) - (4 * self.color_count) > 8:
                 self.normal_type = 1
@@ -566,6 +636,16 @@ class SkeletalMeshAsset(Asset):
                   f'\nUV Count: {self.uv_count}'
                   f'\nColor Count: {self.color_count}')
             f.seek(20, 1)  # TODO figure out between strides and next mesh
+
+            f.seek(-43,1)
+            self.end_bytes = f.read(43)
+        def write(self, f):
+            f.seek(self.lod_count_offset)
+            lod_count = br.uint8(f)
+            f.seek(4, 1)
+            for l in range(self.lod_count):
+                self.lods[l].write(f)
+
         def extract_mesh_file(self,f):
             """
             Creates a file gathering the raw data of all Lods the Mesh.
@@ -592,6 +672,7 @@ class SkeletalMeshAsset(Asset):
         self.bones = []
         self.mesh_count = 0
         self.meshes = []
+        self.end_bytes = None # bytes at the end of the meshes sections
     def parse(self,f):
         super().parse(f)
         self.bone_count = br.uint32(f)
@@ -599,9 +680,37 @@ class SkeletalMeshAsset(Asset):
             self.bones.append(self.Bone(f))
         self.mesh_count = br.uint32(f)
         for m in range(self.mesh_count):
-            mesh = self.Mesh(self)
+            mesh = self.Mesh(self,index = m)
             mesh.parse(f)
             self.meshes.append(mesh)
+        length =  br.uint32(f)
+        f.seek(-4,1)
+        self.end_bytes = f.read(length)
+    def write(self, f):
+        super().write(f)
+        f.seek(12)
+        bone_count = br.uint32(f)
+        for b in range(bone_count):
+            self.Bone(f)
+        mesh_count = br.uint32(f)
+        for m in range(mesh_count):
+            self.meshes[m].write(f)
+    def clear(self):
+        self.bones = []
+        self.meshes = []
+        self.end_bytes = None
+    def get_sorted_lods(self):
+        lod_map = {}
+        for m in self.meshes:
+            for l in m.lods:
+                lod_map[l] = l.data_offset
+        sorted_lods = {k: v for k, v in sorted(lod_map.items(), key=lambda item: item[1])}
+        return sorted_lods
+    def get_mesh_data_start_offset(self):
+        lods = self.get_sorted_lods()
+        first_lod = next(iter(lods))
+        print("Mesh Data Start Offset = ",first_lod.data_offset)
+        return first_lod.data_offset
 
 class BlenderMeshImporter:
     @staticmethod
@@ -646,6 +755,7 @@ class BlenderMeshImporter:
             for v_index in tris:
                 tv = bm.verts[v_index]
                 face_vertices.append(tv)
+            # print(tris)
             bm_face = bm.faces.new(face_vertices)
             bm_face.normal_flip() #this is required because the *-1 on x vertex co flips the mesh normals
         bm.to_mesh(obj_data)
@@ -660,7 +770,7 @@ class BlenderMeshImporter:
             for finder, face in enumerate(bm.faces):
                 for lindex, loop in enumerate(face.loops):
                     v_index = loop.vert.index
-                    v_uv = (uvs[v_index][0],uvs[v_index][1]*-1+1)
+                    v_uv = (uvs[v_index][0], 1 - uvs[v_index][1])
                     loop[uv_layer].uv = v_uv
 
         # Import Colors
@@ -774,11 +884,230 @@ class BlenderMeshExporter:
                 for v in range(lod.vertex_count):
                     lod.write_vertex_position(f, pos=data.vertices[v].co * Vector((-1.0,1.0,1.0)), scale=2)
     @staticmethod
+    def get_vertex_blend_indices(vertex):
+        '''
+        Returns a dictionary of the vertex normalized, sorted and truncated 8 weights.
+        '''
+
+        group_weights = {}
+
+        # Gather bone groups
+        for vg in vertex.groups:
+            if vg.weight > 0.0:
+                group_weights[vg.group] = vg.weight
+
+        # Normalize
+        total_weight = 0
+        for k in group_weights.keys():
+            total_weight += group_weights[k]
+        # print(total_weight)
+        if total_weight == 0:
+            raise Exception("Vertex {v} has no weight".format(v=vertex.index))
+        normalizer = 1/total_weight
+        for gw in group_weights:
+            group_weights[gw] *= normalizer
+
+        # Sort Weights
+        sorted_weights = sorted(group_weights.items(), key=operator.itemgetter(1), reverse=True)
+
+        #Truncate Weights
+        trunc_weights = sorted_weights[0:8]
+        # print(trunc_weights)
+        return trunc_weights
+    @staticmethod
+    def convert_coordinate(co):
+        return Vector((co[0] *-1,co[1],co[2]))
+    @staticmethod
     def write_vertices(file, mesh:SkeletalMeshAsset.Mesh, lod_index = 0):
+        f = file
         obj = BME.find_object_by_name(mesh.name+f"_LOD{lod_index}")
         lod:SkeletalMeshAsset.Mesh.LOD = mesh.lods[lod_index]
         if obj:
             data = obj.data
+            bm = bmesh.new()
+            bm.from_mesh(data)
+            bm.verts.ensure_lookup_table()
+            stride = mesh.vertex_stride
+            pos_length = 0
+            if mesh.position_type == 0:
+                pos_length = 8
+            elif mesh.position_type == 1:
+                pos_length = 12
+            else:
+                pos_length = 12
+            weight_count = int((stride - pos_length) / 2)
+            print(stride, weight_count,mesh.position_type)
+            mesh_bones = list(mesh.mesh_bones.keys())
+            for v in bm.verts:
+                # Write Coordinate
+                if mesh.position_type == 0:
+                    for co in BME.convert_coordinate(v.co):
+                        f.write(bp.int16_norm(co))
+                if mesh.position_type == 1:
+                    for co in BME.convert_coordinate(v.co):
+                        f.write(bp.float(co))
+                vertex = data.vertices[v.index]
+
+                weights = BME.get_vertex_blend_indices(vertex)
+                bi = b''
+                # Write weights
+                int_weights = []
+                for w in weights:
+                    int_weights.append(max(0,min(int(w[1] * ((2 ** 8)-1)),255)))
+                weight_sum = sum(int_weights)
+                extra_weight = 0xFF - weight_sum
+                for i in range(weight_count):
+                    if i > len(weights)-1:
+                        f.write(bp.uint8_norm(0))
+                    else:
+                        f.write(bp.uint8(int_weights[i] + extra_weight))
+                        extra_weight = 0
+                # Write indices
+                for i in range(weight_count):
+                    if i > len(weights)-1:
+                        f.write(bp.uint8(0))
+                    else:
+                        mesh_bone_index = mesh.real_bone_indices_to_mesh_bones[weights[i][0]]
+                        f.write(bp.uint8(mesh_bone_index))
+            # f.write(b'\xFA\x7F\xFA\x7F')
+    @staticmethod
+    def write_normals(file, mesh:SkeletalMeshAsset.Mesh, lod_index = 0):
+        f = file
+        obj = BME.find_object_by_name(mesh.name+f"_LOD{lod_index}")
+        lod:SkeletalMeshAsset.Mesh.LOD = mesh.lods[lod_index]
+        if obj:
+            data = obj.data
+            bm = bmesh.new()
+            bm.from_mesh(data)
+            bm.verts.ensure_lookup_table()
+            bm.faces.ensure_lookup_table()
+            data.loops.data.calc_tangents()
+            NTB = [((1.0,0.0,0.0),(0.0,1.0,0.0),1.0)] * len(data.vertices)
+            UVs = [(0.0,0.0)] * len(data.vertices)
+            color_layer = bm.verts.layers.float_color["Color_0"]  # TODO support multiple color layers
+            for bface in bm.faces:
+                for loop in bface.loops:
+                    u = loop[bm.loops.layers.uv[0]].uv[0]
+                    v = 1 - loop[bm.loops.layers.uv[0]].uv[1]
+                    UVs[loop.vert.index] = [u, v]
+
+            for l in data.loops:
+                if l.bitangent_sign == -1:
+                    flip = -1.0
+                else:
+                    flip = 1.0
+                NTB[l.vertex_index] = (l.normal,l.tangent,flip)
+            for v in data.vertices:
+                # Write Normals
+                normal = NTB[v.index][0] #TODO support other normal format
+                f.write(bp.float(normal[0]*-1))
+                f.write(bp.float(normal[1]))
+                f.write(bp.float(normal[2]))
+                tangent = NTB[v.index][1]
+                f.write(bp.float(tangent[0]*-1))
+                f.write(bp.float(tangent[1]))
+                f.write(bp.float(tangent[2]))
+                v_flip = NTB[v.index][2]
+                f.write(bp.float(v_flip))
+
+                # Write Vertex Color
+                vertex_color = bm.verts[v.index][color_layer]
+                for c in vertex_color:
+                    f.write(bp.uint8_norm(c))
+
+                # Write UVs
+                for uv in UVs[v.index]:
+                    f.write(bp.int16_norm(uv))
+            bm.free()
+    @staticmethod
+    def write_triangles(file, mesh:SkeletalMeshAsset.Mesh, lod_index = 0):
+        f = file
+        obj = BME.find_object_by_name(mesh.name + f"_LOD{lod_index}")
+        lod: SkeletalMeshAsset.Mesh.LOD = mesh.lods[lod_index]
+        if obj:
+            data = obj.data
+            bm = bmesh.new()
+            bm.from_mesh(data)
+            bm.verts.ensure_lookup_table()
+            bm.faces.ensure_lookup_table()
+            # Write Faces
+            # for p in data.polygons:
+            #     for v in p.vertices:
+            #         f.write(bp.uint16(v))
+            for p in data.polygons:
+                f.write(bp.uint16(p.vertices[0]))
+                f.write(bp.uint16(p.vertices[2]))
+                f.write(bp.uint16(p.vertices[1]))
+            # f.write(b'\xFA\x7F\xFA\x7F\xFA\x7F\xFA\x7F\xFA\x7F\xFA\x7F')
+            bm.free()
+    @staticmethod
+    def copy_previous_mesh_data(source_path, file,mesh_index = 0,lod_index = 0):
+        sorted_lods = asset.get_sorted_lods()
+        with open(source_path, 'rb') as source:
+            for lod in sorted_lods:
+                print(lod.data_offset, lod.data_size, lod.vertex_count)
+                if lod.index == lod_index and lod.parent_mesh.index == mesh_index:
+                    return
+                source.seek(lod.data_offset)
+                file.write(source.read(lod.data_size))
+    @staticmethod
+    def create_mesh_file(mesh_index = 0, lod_index = -1):
+        """
+        Creates a BytesIO of the reverse sorted LODs of a mesh using the edited blender mesh of the given Lod Index.
+        :return: Mesh class with LODs created with the new offset and size information.
+        :return: BytesIO of all mesh LODs.
+        """
+        SWOMT = bpy.context.scene.SWOMT
+        file = SWOMT.AssetPath
+        mesh_file = io.BytesIO()
+        offset_diff = 0
+        # lod_index = -1
+        mesh = asset.meshes[mesh_index]
+        # modded_mesh:SkeletalMeshAsset.Mesh = asset.meshes[mesh_index]
+        modded_mesh:SkeletalMeshAsset.Mesh = copy.deepcopy(asset.meshes[mesh_index])
+
+        with open(file, 'rb') as source:
+            for lod in reversed(asset.meshes[mesh_index].lods):
+                current_modded_lod = modded_mesh.lods[lod.index]
+                current_modded_lod.parent_mesh = modded_mesh
+                new_vertex_data_offset_a = mesh_file.tell()
+                if lod.index == lod_index:
+                    print("Edited LOD")
+                    obj = BME.find_object_by_name(mesh.name + f"_LOD{lod_index}")
+                    current_modded_lod.vertex_count = len(obj.data.vertices)
+                    current_modded_lod.index_count = len(obj.data.polygons) * 3
+                    print("New Vertex count: ", len(obj.data.vertices))
+                    print("New indices count: ", len(obj.data.polygons) * 3)
+                    # Vertices
+                    current_modded_lod.vertex_data_offset_a = mesh_file.tell()
+                    BME.write_vertices(mesh_file, mesh, lod_index)
+                    mesh_file.write(lod.vertex_end_bytes)
+                    # Normals
+                    current_modded_lod.vertex_data_offset_b = mesh_file.tell()
+                    BME.write_normals(mesh_file, mesh, lod_index)
+                    mesh_file.write(lod.normals_end_bytes)
+                    # Indices
+                    current_modded_lod.face_block_offset = mesh_file.tell()
+                    BME.write_triangles(mesh_file, mesh, lod_index)
+                    mesh_file.write(lod.faces_end_bytes)
+
+                else: #Unedited lod taken from source file.
+                    source.seek(lod.data_offset)
+
+                    current_modded_lod.vertex_data_offset_a = new_vertex_data_offset_a
+                    offset_diff = new_vertex_data_offset_a - lod.vertex_data_offset_a
+                    current_modded_lod.vertex_data_offset_b = lod.vertex_data_offset_b + offset_diff
+                    current_modded_lod.face_block_offset = lod.face_block_offset + offset_diff
+
+                    mesh_file.write(source.read(lod.data_size))
+
+                current_modded_lod.data_size = mesh_file.tell() - new_vertex_data_offset_a
+                print("\n", lod.index, lod.data_offset, lod.data_size, lod.vertex_count)
+                print("Vertex_data_offset_a = ", new_vertex_data_offset_a, "   was  ", lod.vertex_data_offset_a,
+                      "  diff = ", offset_diff)
+                print("Mesh_File data start : ", new_vertex_data_offset_a, "Data Size : ", current_modded_lod.data_size)
+        modded_mesh.mesh_file = mesh_file
+        return modded_mesh
 
 asset : SkeletalMeshAsset = None
 BMI = BlenderMeshImporter
@@ -844,11 +1173,98 @@ class ExportLOD(bpy.types.Operator):
         return asset is not None
 
     def execute(self,context):
-        mod_file = BME.copy_mmb_file()
-        BME.overwrite_vertex_positions(file=mod_file,
-                                       skeletal_mesh=asset,
-                                       mesh=asset.meshes[self.mesh_index],
-                                       lod_index=self.lod_index)
+        # mod_file = BME.copy_mmb_file()
+        # BME.overwrite_vertex_positions(file=mod_file,
+        #                                skeletal_mesh=asset,
+        #                                mesh=asset.meshes[self.mesh_index],
+        #                                lod_index=self.lod_index)
+        SWOMT = bpy.context.scene.SWOMT
+        file = SWOMT.AssetPath
+        mesh = asset.meshes[self.mesh_index]
+        lod = mesh.lods[self.lod_index]
+        obj = BME.find_object_by_name(mesh.name + f"_LOD{self.lod_index}")
+        print(file)
+        print(self.mesh_index, self.lod_index)
+        print(mesh.lod_count_offset)
+        f = io.BytesIO()
+        # modded_mesh, mesh_file = BME.create_mesh_file(self.mesh_index, self.lod_index)
+        modded_asset = SkeletalMeshAsset()
+
+        # Create modded mesh files and mesh data
+        for m in asset.meshes:
+            if m.index == self.mesh_index:
+                modded_mesh = BME.create_mesh_file(self.mesh_index,self.lod_index)
+            else:
+                modded_mesh = BME.create_mesh_file(m.index)
+            modded_asset.meshes.append(modded_mesh)
+
+        # Copy Header from source mmb
+        with open(file, 'rb') as mmb:
+            f.write(mmb.read(asset.get_mesh_data_start_offset()))
+
+        # Write sorted mesh data
+        new_header_size = -1
+        for lod in modded_asset.get_sorted_lods():
+            print(lod.parent_mesh.index, lod.parent_mesh.name,lod.index, lod.vertex_data_offset_a, lod.data_size, f.tell())
+            if new_header_size == -1:
+                if not lod.is_header_lod:
+                    new_header_size = f.tell()
+            mesh_file = lod.parent_mesh.mesh_file
+            mesh_file.seek(lod.vertex_data_offset_a)
+            lod.data_offset = f.tell()
+            f.write(mesh_file.read(lod.data_size))
+
+        modded_asset.size = new_header_size
+        # Update header values
+        modded_asset.write(f)
+
+        with open(file, "wb") as outfile:
+            outfile.write(f.getbuffer())
+
+        with open(SWOMT.AssetPath, 'rb') as f_:
+            asset.clear()
+            asset.parse(f_)
+
+        return {'FINISHED'}
+        with open(file, 'rb') as mmb:
+            f.write(mmb.read(asset.meshes[self.mesh_index].lod_count_offset))
+            f.write(bp.uint8(1)) #LOD count
+            f.write(bp.uint32(858993168))
+
+            bm = bmesh.new()
+            bm.from_mesh(obj.data)
+            tris = len(obj.data.polygons)
+            vertex_offset = 0
+            vertex_size = (mesh.vertex_stride * len(obj.data.vertices)) + 4
+            normals_offset = vertex_offset + vertex_size
+            normal_size = (mesh.normals_stride * len(obj.data.vertices)) + 4
+            face_offset = normals_offset + normal_size
+            print(vertex_offset, vertex_size, normals_offset,normal_size,face_offset)
+
+            f.write(bp.uint32(len(obj.data.vertices))) # Vertex count
+            f.write(bp.uint32(tris*3)) # Indices count
+            f.write(bp.uint32(int(face_offset / 2))) # Face_offset / 2
+            f.write(bp.uint32(vertex_offset)) # Vertices Offset
+            f.write(bp.uint32(normals_offset)) # Normals Offset
+            f.write(bp.uint32(face_offset)) # Face Offset
+            f.write(bp.uint32(0)) # data_offset
+            f.write(bp.uint32(0))  #data_size
+            f.write(bp.uint32(0)) # unknown
+            f.write(mesh.end_bytes)
+            f.write(asset.end_bytes)
+
+
+
+        with open(file+"__","wb") as outfile:
+            outfile.write(f.getbuffer())
+            vertex_start = outfile.tell()
+            BME.write_vertices(outfile,mesh,self.lod_index)
+            normals_start = outfile.tell()
+            BME.write_normals(outfile,mesh,self.lod_index)
+            face_start = outfile.tell()
+            BME.write_triangles(outfile,mesh,self.lod_index)
+            print(vertex_start,normals_start,face_start)
+
         return {'FINISHED'}
 # PANELS #
 class SWOMTPanel(bpy.types.Panel):
