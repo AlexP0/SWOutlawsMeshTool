@@ -191,7 +191,7 @@ class BytePacker:
         return pack('<B', v)
     @staticmethod
     def uint8_norm(v):
-        if 0.0 <= v <= 1.0:
+        if 0.0 <= v <= 1.001:
             i = max(0,min(int(v * ((2 ** 8)-1)),255))
         else:
             raise Exception("Couldn't normalize value as uint8Norm, "
@@ -271,6 +271,13 @@ class BytePacker:
 
         v = x | y | z | w
         return pack("<I", v)
+    @staticmethod
+    def matrix_4x4(matrix:Matrix):
+        out_matrix = b''
+        for i in range(4):
+            for c in range(4):
+                out_matrix += bp.float(matrix[c][i])
+        return out_matrix
 
 br = ByteReader
 bp = BytePacker
@@ -373,6 +380,7 @@ class SkeletalMeshAsset(Asset):
             def write(self, f):
                 f.seek(self.start_offset)
                 f.write(bp.uint32(self.vertex_count))
+                # print("Written vertex count: ",self.vertex_count)
                 f.write(bp.uint32(self.index_count))
                 f.write(bp.uint32(int(self.face_block_offset / 2)))
                 f.write(bp.uint32(self.vertex_data_offset_a))
@@ -390,26 +398,34 @@ class SkeletalMeshAsset(Asset):
                 else:
                     extra_bytes_size = self.vertex_data_offset_b - self.vertex_data_offset_a - real_vertex_size
                 f.seek(real_vertex_size, 1)
-                print(f.tell())
-                self.vertex_end_bytes = f.read(extra_bytes_size)
-                print("Vertex Extra Bytes:",self.vertex_end_bytes)
+                # print(f.tell())
+                if extra_bytes_size > 0:
+                    self.vertex_end_bytes = f.read(extra_bytes_size)
+                else:
+                    print("No Extra Vertex bytes: ", extra_bytes_size)
+                # print("Vertex Extra Bytes:",self.vertex_end_bytes)
 
                 if not self.vertex_data_offset_a == self.vertex_data_offset_b:
                     real_normals_size = self.vertex_count * self.parent_mesh.normals_stride
                     extra_bytes_size = self.face_block_offset - self.vertex_data_offset_b - real_normals_size
                     f.seek(real_normals_size, 1)
-                    print(f.tell())
-                    self.normals_end_bytes = f.read(extra_bytes_size)
-                    print("Normal Extra Bytes:",self.normals_end_bytes)
+                    # print(f.tell())
+                    if extra_bytes_size > 0:
+                        self.normals_end_bytes = f.read(extra_bytes_size)
+                    else:
+                        print("No Extra Normals bytes: ", extra_bytes_size)
+                    # print("Normal Extra Bytes:",self.normals_end_bytes)
 
                 real_face_size = self.index_count * 2
                 size_without_face = self.face_block_offset - self.vertex_data_offset_a
                 extra_bytes_size = self.data_size - size_without_face - real_face_size
                 f.seek(real_face_size, 1)
-                print(f.tell())
-                self.faces_end_bytes = f.read(extra_bytes_size)
-                print("Face Extra Bytes:",self.faces_end_bytes)
-
+                # print(f.tell())
+                if extra_bytes_size > 0:
+                    self.faces_end_bytes = f.read(extra_bytes_size)
+                # print("Face Extra Bytes:",self.faces_end_bytes)
+                else:
+                    print("No Extra Face bytes: ", extra_bytes_size)
                 f.seek(offset)
 
             def get_vertex_positions(self,raw_mesh_file):
@@ -654,13 +670,17 @@ class SkeletalMeshAsset(Asset):
             self.index = index
             self.name = ""
             self.lod_count_offset = 0
+            self.binding_count_offset = 0
+            self.binding_count = 0
             self.lod_count = 0
             self.lods = []
             self.vertex_stride = 0
             self.normals_stride = 0
 
             self.mesh_bones = {}
+            self.extra_bones = [] # bones that weren't in mesh_bones but are needed for mod mesh.
             self.real_bone_indices_to_mesh_bones = {}
+
             self.color_count = 0
             self.uv_count = 0
             self.normal_type = 0 # 0:int8_norm 1:floats
@@ -678,10 +698,12 @@ class SkeletalMeshAsset(Asset):
             y_count = br.uint16(f)
             f.seek(4 * y_count, 1)
             print("Binding Count Offset:", f.tell())
-            binding_count = br.uint16(f)
-            for b in range(binding_count):
+            self.binding_count_offset = f.tell()
+            self.binding_count = br.uint16(f)
+            for b in range(self.binding_count):
                 matrix = br.matrix_4x4(f)
                 bone_index = br.uint16(f)
+                self.parent_sk_mesh.bones[bone_index].set_mesh_matrix(matrix)
                 self.mesh_bones[bone_index] = matrix
                 self.real_bone_indices_to_mesh_bones[bone_index] = b
                 print(bone_index, " = ", b)
@@ -777,6 +799,10 @@ class SkeletalMeshAsset(Asset):
             self.name = br.name(f)
             self.matrix = br.matrix_4x4(f)
             self.parent_index = br.uint16(f)
+            self.mesh_matrix = None
+        def set_mesh_matrix(self,matrix):
+            if self.mesh_matrix is None:
+                self.mesh_matrix = matrix
 
     def __init__(self):
         super().__init__()
@@ -801,6 +827,16 @@ class SkeletalMeshAsset(Asset):
         length =  br.uint32(f)
         f.seek(-4,1)
         self.end_bytes = f.read(length)
+
+        # for i,b in enumerate(self.bones):
+        #     print(i, b.name)
+        #     print(b.mesh_matrix)
+        #     print("_")
+        #     print(b.matrix)
+        #     print("____________________")
+        #     if b.mesh_matrix is None:
+        #         print("*/*/*/*/*/*/*/*/*/*")
+
     def write(self, f):
         super().write(f)
         f.seek(12)
@@ -904,15 +940,20 @@ class BlenderMeshImporter:
         # Import Bone Weights
         weights = lod.get_bone_weights(raw_mesh_file)
         mesh_bones = list(mesh.mesh_bones.keys())
+        print(mesh_bones)
         for bone in skeletal_mesh.bones:
             obj.vertex_groups.new(name=bone.name)
         for v_index in range(lod.vertex_count):
+            if v_index == 2200:
+                print(weights[v_index])
             v_bone_weights = weights[v_index]
             for bone_index in v_bone_weights.keys():
                 if bone_index < len(mesh_bones):
                     real_bone_index = mesh_bones[bone_index] # Convert mesh bone index to skeleton bone index
                     bone_name = skeletal_mesh.bones[real_bone_index].name
                     obj.vertex_groups[bone_name].add([v_index],v_bone_weights[bone_index], "ADD")
+                else:
+                    print("Bone index out of MeshBone range : ", bone_index)
         return obj
 
     @staticmethod
@@ -942,6 +983,9 @@ class BlenderMeshImporter:
             if bone.parent:
                 parent_matrix = bone.parent.matrix
             bone.matrix = parent_matrix @ b.matrix
+            # if i == 0:
+            #     print(b.matrix)
+            # bone.matrix = b.matrix
         scale_matrix = Matrix().Scale(-1.0, 4, Vector((1.0, 0.0, 0.0)))
         _armature.transform(scale_matrix)
         bpy.ops.object.mode_set(mode='OBJECT')
@@ -1035,6 +1079,7 @@ class BlenderMeshExporter:
     @staticmethod
     def write_vertices(file, mesh:SkeletalMeshAsset.Mesh, lod_index = 0):
         f = file
+        extra_bones = [] # indices of bones that aren't part of the original mesh but weighted on the modded mesh. {real bone: mesh bone}
         obj = BME.find_object_by_name(mesh.name+f"_LOD{lod_index}")
         lod:SkeletalMeshAsset.Mesh.LOD = mesh.lods[lod_index]
         if obj:
@@ -1082,10 +1127,16 @@ class BlenderMeshExporter:
                     if i > len(weights)-1:
                         f.write(bp.uint8(0))
                     else:
-                        print(weights[i], weights[i][0], mesh.real_bone_indices_to_mesh_bones)
-                        mesh_bone_index = mesh.real_bone_indices_to_mesh_bones[weights[i][0]]
+                        if mesh.real_bone_indices_to_mesh_bones.__contains__(weights[i][0]):
+                            # print(weights[i], weights[i][0], mesh.real_bone_indices_to_mesh_bones)
+                            mesh_bone_index = mesh.real_bone_indices_to_mesh_bones[weights[i][0]]
+                        else:
+                            print("Extra Bone : ", weights[i][0])
+                            mesh.real_bone_indices_to_mesh_bones[weights[i][0]] = mesh.real_bone_indices_to_mesh_bones.__len__()
+                            extra_bones.append(weights[i][0])
+                            mesh_bone_index = mesh.real_bone_indices_to_mesh_bones[weights[i][0]]
                         f.write(bp.uint8(mesh_bone_index))
-            # f.write(b'\xFA\x7F\xFA\x7F')
+            return extra_bones
     @staticmethod
     def write_normals(file, mesh:SkeletalMeshAsset.Mesh, lod_index = 0):
         f = file
@@ -1203,16 +1254,20 @@ class BlenderMeshExporter:
                     print("New indices count: ", len(obj.data.polygons) * 3)
                     # Vertices
                     current_modded_lod.vertex_data_offset_a = mesh_file.tell()
-                    BME.write_vertices(mesh_file, mesh, lod_index)
-                    mesh_file.write(lod.vertex_end_bytes)
+                    modded_mesh.extra_bones = BME.write_vertices(mesh_file, mesh, lod_index)
+                    print(modded_mesh.extra_bones)
+                    if lod.vertex_end_bytes:
+                        mesh_file.write(lod.vertex_end_bytes)
                     # Normals
                     current_modded_lod.vertex_data_offset_b = mesh_file.tell()
                     BME.write_normals(mesh_file, mesh, lod_index)
-                    mesh_file.write(lod.normals_end_bytes)
+                    if lod.normals_end_bytes:
+                        mesh_file.write(lod.normals_end_bytes)
                     # Indices
                     current_modded_lod.face_block_offset = mesh_file.tell()
                     BME.write_triangles(mesh_file, mesh, lod_index)
-                    mesh_file.write(lod.faces_end_bytes)
+                    if lod.faces_end_bytes:
+                        mesh_file.write(lod.faces_end_bytes)
 
                 else: #Unedited lod taken from source file.
                     source.seek(lod.data_offset)
@@ -1306,13 +1361,13 @@ class ExportLOD(bpy.types.Operator):
         mesh = asset.meshes[self.mesh_index]
         lod = mesh.lods[self.lod_index]
         obj = BME.find_object_by_name(mesh.name + f"_LOD{self.lod_index}")
+        print("\n ////////////////////////\n ///////// EXPORT ////////// \n ////////////////////////")
         print(file)
         print(self.mesh_index, self.lod_index)
         print(mesh.lod_count_offset)
         f = io.BytesIO()
         # modded_mesh, mesh_file = BME.create_mesh_file(self.mesh_index, self.lod_index)
         modded_asset = SkeletalMeshAsset()
-
         # Create modded mesh files and mesh data
         for m in asset.meshes:
             if m.index == self.mesh_index:
@@ -1322,8 +1377,49 @@ class ExportLOD(bpy.types.Operator):
             modded_asset.meshes.append(modded_mesh)
 
         # Copy Header from source mmb
+        # Extra bones matrices are added now before we add the mesh data so the offsets are correct.
+        # Other header variables that don't change the size of the file are edited later.
         with open(file, 'rb') as mmb:
-            f.write(mmb.read(asset.get_mesh_data_start_offset()))
+            # If mesh Extra Bones
+            modded_mesh = modded_asset.meshes[self.mesh_index]
+            if modded_mesh.extra_bones:
+                #   Copy until edited mesh bone matrices
+                f.write(mmb.read(modded_mesh.binding_count_offset))
+
+                extra_bone_count = len(modded_mesh.extra_bones)
+                f.write(bp.uint16(modded_mesh.binding_count + extra_bone_count))
+                mmb.seek(modded_mesh.binding_count_offset + 2)
+
+                #   Write existing bone matrices
+                for i in range(modded_mesh.binding_count):
+                    f.write(mmb.read(66))
+
+                #   Add extra bones
+                for b in modded_mesh.extra_bones:
+                    if b < len(asset.bones):
+                        bone = asset.bones[b]
+                        if bone.mesh_matrix is not None:
+                            f.write(bp.matrix_4x4(bone.mesh_matrix))
+                            f.write(bp.uint16(b))
+                        else:
+                            f.write(bp.matrix_4x4(bone.matrix.inverted()))
+                            f.write(bp.uint16(b))
+                    else:
+                        raise Exception("bone out of range:", b)
+                #   Copy the rest of header
+                rest_of_header_size = asset.get_mesh_data_start_offset() - mmb.tell()
+                f.write(mmb.read(rest_of_header_size))
+
+                # Update start_offset of affected Lods and lod_count_offset of Meshes
+                added_size = len(modded_mesh.extra_bones) * 66
+                for m in modded_asset.meshes:
+                    if m.lod_count_offset > modded_mesh.binding_count_offset:
+                        m.lod_count_offset += added_size
+                        for l in m.lods:
+                            l.start_offset += added_size
+            # Else copy full header
+            else:
+                f.write(mmb.read(asset.get_mesh_data_start_offset()))
 
         # Write sorted mesh data
         new_header_size = -1
