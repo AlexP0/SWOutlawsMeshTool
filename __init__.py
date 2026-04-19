@@ -20,6 +20,7 @@ from mathutils import Matrix, Euler, Vector
 from pathlib import Path
 import os
 import io
+import shutil
 
 
 class ByteReader:
@@ -337,6 +338,7 @@ class SkeletalMeshAsset(Asset):
                 self.face_block_offset = 0
                 self.data_offset = 0
                 self.data_size = 0
+                self.lod_screen_size = 0.0
                 self.data_x_offset = 0
                 self.data_x_size = 0
                 self.data_y_offset = 0
@@ -359,20 +361,21 @@ class SkeletalMeshAsset(Asset):
                 self.face_block_offset = br.uint32(f)
                 self.data_offset = br.uint32(f)
                 self.data_size = br.uint32(f)
-                lod_screen_size = br.float(f)  # not confirmed screen size
-                if lod_info_type == 0:
-                    pass
-                elif lod_info_type == 12:
-                    unk1 = br.uint32(f)
-                    self.data_x_offset = br.uint32(f)
-                    self.data_x_size = br.uint32(f)
-                    unk2 = br.uint32(f)
-                    self.data_y_offset = br.uint32(f)
-                    self.data_y_size = br.uint32(f)
-                    self.local_vertex_stride = int(self.data_y_size / self.vertex_count)
-                    print("New Vertex Stride = ", self.local_vertex_stride)
-                else:
-                    f.seek(28,1)
+                self.lod_screen_size = br.float(f)  # not confirmed screen size
+                if self.vertex_count > 0:
+                    if lod_info_type == 0:
+                        pass
+                    elif lod_info_type == 12:
+                        unk1 = br.uint32(f)
+                        self.data_x_offset = br.uint32(f)
+                        self.data_x_size = br.uint32(f)
+                        unk2 = br.uint32(f)
+                        self.data_y_offset = br.uint32(f)
+                        self.data_y_size = br.uint32(f)
+                        self.local_vertex_stride = int(self.data_y_size / self.vertex_count)
+                        print("New Vertex Stride = ", self.local_vertex_stride)
+                    else:
+                        f.seek(28,1)
                 if self.data_offset < self.parent_mesh.parent_sk_mesh.size:
                     self.is_header_lod = True
                     print("Lod ", self.index, "is in header.")
@@ -388,6 +391,7 @@ class SkeletalMeshAsset(Asset):
                 f.write(bp.uint32(self.face_block_offset))
                 f.write(bp.uint32(self.data_offset))
                 f.write(bp.uint32(self.data_size))
+                f.write(bp.float(self.lod_screen_size))
 
             def gather_extra_bytes(self,f):
                 offset = f.tell()
@@ -648,7 +652,10 @@ class SkeletalMeshAsset(Asset):
                 x = pos[0]
                 y = pos[1]
                 z = pos[2]
-                stride = self.parent_mesh.vertex_stride
+                if self.local_vertex_stride > 0:
+                    stride = self.local_vertex_stride
+                else:
+                    stride = self.parent_mesh.vertex_stride
                 stride_start = f.tell()
                 if self.parent_mesh.position_type == 0:
                     f.write(bp.int16_norm(x / scale))
@@ -754,7 +761,8 @@ class SkeletalMeshAsset(Asset):
             # Gather extra bytes at the end of each LOD's vertex/normal/face data.
             # Must be done after getting stride lengths.
             for l in self.lods:
-                l.gather_extra_bytes(f)
+                if l.vertex_count > 0:
+                    l.gather_extra_bytes(f)
 
             # guessing the type of normal data int8 or floats
             if self.normals_stride - (4 * self.uv_count) - (4 * self.color_count) > 8:
@@ -1039,7 +1047,11 @@ class BlenderMeshExporter:
         if obj:
             data = obj.data
             with open(file,'rb+') as f:
-                f.seek(lod.data_offset)
+                if lod.data_y_offset != 0:
+                    print("Vertex Data is in mmb file.")
+                    f.seek(lod.data_y_offset)
+                else:
+                    f.seek(lod.data_offset)
                 for v in range(lod.vertex_count):
                     lod.write_vertex_position(f, pos=data.vertices[v].co * Vector((-1.0,1.0,1.0)), scale=2)
     @staticmethod
@@ -1077,6 +1089,12 @@ class BlenderMeshExporter:
     def convert_coordinate(co):
         return Vector((co[0] *-1,co[1],co[2]))
     @staticmethod
+    def get_mesh_normalize_scale(obj):
+        max_value = 0.0
+        for bb in obj.bound_box:
+            max_value = max(max_value,max(bb))
+        return int(math.ceil(max_value))
+    @staticmethod
     def write_vertices(file, mesh:SkeletalMeshAsset.Mesh, lod_index = 0):
         f = file
         extra_bones = [] # indices of bones that aren't part of the original mesh but weighted on the modded mesh. {real bone: mesh bone}
@@ -1087,7 +1105,10 @@ class BlenderMeshExporter:
             bm = bmesh.new()
             bm.from_mesh(data)
             bm.verts.ensure_lookup_table()
-            stride = mesh.vertex_stride
+            if lod.local_vertex_stride > 0:
+                stride = lod.local_vertex_stride
+            else:
+                stride = mesh.vertex_stride
             pos_length = 0
             if mesh.position_type == 0:
                 pos_length = 8
@@ -1101,8 +1122,10 @@ class BlenderMeshExporter:
             for v in bm.verts:
                 # Write Coordinate
                 if mesh.position_type == 0:
+                    scale = BME.get_mesh_normalize_scale(obj)
                     for co in BME.convert_coordinate(v.co):
-                        f.write(bp.int16_norm(co))
+                        f.write(bp.int16_norm(co/scale))
+                    f.write(bp.int16(scale))
                 if mesh.position_type == 1:
                     for co in BME.convert_coordinate(v.co):
                         f.write(bp.float(co))
@@ -1291,8 +1314,12 @@ asset : SkeletalMeshAsset = None
 BMI = BlenderMeshImporter
 BME = BlenderMeshExporter
 
+class SWOMT_ModAsset(bpy.types.PropertyGroup):
+    AssetPath : bpy.props.StringProperty(name="Asset Path", subtype="FILE_PATH")
+
 class SWOMTSettings(bpy.types.PropertyGroup):
-    AssetPath: bpy.props.StringProperty(name="Asset Path", subtype="FILE_PATH")
+    AssetPath : bpy.props.StringProperty(name="Asset Path", subtype="FILE_PATH")
+    ModAssets : bpy.props.CollectionProperty(type=SWOMT_ModAsset)
 
 # OPERATORS #
 class LoadMMB(bpy.types.Operator):
@@ -1310,6 +1337,33 @@ class LoadMMB(bpy.types.Operator):
             asset = sk_mesh
 
         return {'FINISHED'}
+class AddModAsset(bpy.types.Operator):
+    """Add current AssetPath to mod assets."""
+    bl_idname = "object.add_mod_asset"
+    bl_label = "Toggle asset in mod assets"
+    bl_description = "Add current AssetPath to mod assets."
+    @classmethod
+    def description(cls,context,properties):
+        SWOMT = context.scene.SWOMT
+        mod_assets = SWOMT.ModAssets
+        if mod_assets.find(SWOMT.AssetPath) == -1:
+            return "Add the current asset to mod assets."
+        else:
+            return "Remove the current asset from mod assets."
+
+    def execute(self,context):
+        SWOMT = context.scene.SWOMT
+        mod_assets = SWOMT.ModAssets
+        if mod_assets.find(SWOMT.AssetPath) == -1:
+            print("Added current AssetPath to mod assets.")
+            new_mod_path = mod_assets.add()
+            new_mod_path.AssetPath = SWOMT.AssetPath
+            new_mod_path.name = SWOMT.AssetPath
+        else:
+            mod_assets.remove(mod_assets.find(SWOMT.AssetPath))
+            print("Removed current AssetPath from mod assets.")
+        return {'FINISHED'}
+
 
 class ImportLOD(bpy.types.Operator):
     """Imports the given LOD"""
@@ -1337,7 +1391,38 @@ class ImportLOD(bpy.types.Operator):
         BMI.parent_obj_to_armature(obj,armature)
         BMI.rotate_model(obj,armature)
         return {'FINISHED'}
+class DeleteLOD(bpy.types.Operator):
+    """Deletes the given LOD."""
+    bl_idname = 'object.delete_lod'
+    bl_label = ''
 
+    mesh_index: bpy.props.IntProperty()
+    lod_index: bpy.props.IntProperty()
+
+    @classmethod
+    def poll(cls,context):
+        return asset is not None
+
+    def execute(self,context):
+        sk_mesh = asset
+        mesh = sk_mesh.meshes[self.mesh_index]
+        lod = mesh.lods[self.lod_index]
+        SWOMT = context.scene.SWOMT
+
+        with open(SWOMT["AssetPath"], 'rb+') as f:
+
+            if lod.index == 0:
+                f.seek(lod.start_offset)
+                # f.write(bp.uint32(0)) #clear Vertex Count
+                f.write(bp.uint32(0)) #clear Index Count
+
+            f.seek(lod.start_offset + 32)
+            f.write(bp.float(1.0))
+
+        with open(SWOMT.AssetPath, 'rb') as f_:
+            asset.clear()
+            asset.parse(f_)
+        return {'FINISHED'}
 class ExportLOD(bpy.types.Operator):
     """Exports the given LOD"""
     bl_idname = 'object.export_lod'
@@ -1485,6 +1570,60 @@ class ExportLOD(bpy.types.Operator):
             print(vertex_start,normals_start,face_start)
 
         return {'FINISHED'}
+class OverwriteVertices(bpy.types.Operator):
+    """Exports the given LOD"""
+    bl_idname = 'object.overwrite_lod_vertices'
+    bl_label = 'Overwrite Vertices'
+
+    mesh_index: bpy.props.IntProperty()
+    lod_index: bpy.props.IntProperty()
+
+    @classmethod
+    def poll(cls,context):
+        return asset is not None
+
+    def execute(self,context):
+        file = bpy.context.scene.SWOMT.AssetPath
+        BME.overwrite_vertex_positions(file=file,
+                                       skeletal_mesh=asset,
+                                       mesh=asset.meshes[self.mesh_index],
+                                       lod_index=self.lod_index)
+        return {'FINISHED'}
+
+class CreateBackup(bpy.types.Operator):
+    """Create a backup of the current file."""
+    bl_idname = 'object.create_backup'
+    bl_label = 'Create Backup'
+
+    @classmethod
+    def poll(cls,context):
+        SWOMT = context.scene.SWOMT
+        return SWOMT["AssetPath"] is not None
+
+    def execute(self,context):
+        SWOMT = context.scene.SWOMT
+        asset_path = SWOMT["AssetPath"]
+        shutil.copy(asset_path, asset_path+".bak")
+
+        return {'FINISHED'}
+class RevertToBackup(bpy.types.Operator):
+    """Overwrites the current file with the created backup."""
+    bl_idname = 'object.revert_to_backup'
+    bl_label = 'Revert To Backup'
+
+    @classmethod
+    def poll(cls,context):
+        SWOMT = context.scene.SWOMT
+        asset_path = SWOMT["AssetPath"]
+        return os.path.isfile(asset_path+".bak")
+
+    def execute(self,context):
+        SWOMT = context.scene.SWOMT
+        asset_path = SWOMT["AssetPath"]
+        if os.path.isfile(asset_path+".bak"):
+            shutil.copy(asset_path+".bak", asset_path)
+
+        return {'FINISHED'}
 # PANELS #
 class SWOMTPanel(bpy.types.Panel):
     """Creates a Panel in the Scene Properties window"""
@@ -1501,7 +1640,19 @@ class SWOMTPanel(bpy.types.Panel):
         layout = self.layout
         row = layout.row()
         row.prop(SWOMT, "AssetPath")
+        mod_assets = SWOMT.ModAssets
+        if mod_assets.find(SWOMT.AssetPath) == -1:
+            label = "+"
+            icon = "OUTLINER_COLLECTION"
+        else:
+            label = '-'
+            icon = "COLLECTION_COLOR_04"
+        row.operator("object.add_mod_asset",text="", icon = icon)
+
         layout.row().operator("object.load_mmb")
+        row = layout.row()
+        row.operator("object.create_backup")
+        row.operator("object.revert_to_backup")
 
 class MeshPanel(bpy.types.Panel):
     bl_label = "Mesh"
@@ -1524,25 +1675,41 @@ class MeshPanel(bpy.types.Panel):
                 mesh_box.label(text = m.name, icon = "MESH_ICOSPHERE")
                 for li,l in enumerate(m.lods):
                     row = mesh_box.row()
-                    row.label(text = f"LOD{li} - {l.vertex_count}", icon = "CON_SIZELIKE")
+                    icon = "CON_SIZELIKE"
+                    if l.lod_screen_size == 1.0:
+                       icon = "STRIP_COLOR_01"
+                    row.label(text = f"LOD{li} - {l.vertex_count}", icon = icon)
                     lod_import_button = row.operator("object.import_lod")
                     lod_import_button.lod_index = li
                     lod_import_button.mesh_index = mi
                     lod_export_button = row.operator("object.export_lod")
                     lod_export_button.lod_index = li
                     lod_export_button.mesh_index = mi
+                    lod_overwrite_button = row.operator("object.overwrite_lod_vertices",text='',icon = "STICKY_UVS_VERT")
+                    lod_overwrite_button.lod_index = li
+                    lod_overwrite_button.mesh_index = mi
+                    lod_delete_button = row.operator("object.delete_lod",icon='X')
+                    lod_delete_button.lod_index = li
+                    lod_delete_button.mesh_index = mi
 
-classes=[SWOMTSettings,
+classes=[SWOMT_ModAsset,
+         SWOMTSettings,
          SWOMTPanel,
          MeshPanel,
          LoadMMB,
          ImportLOD,
-         ExportLOD]
+         ExportLOD,
+         CreateBackup,
+         RevertToBackup,
+         DeleteLOD,
+         AddModAsset,
+         OverwriteVertices]
 
 def register():
     for c in classes:
         bpy.utils.register_class(c)
     bpy.types.Scene.SWOMT = bpy.props.PointerProperty(type=SWOMTSettings)
+
 
 def unregister():
     for c in classes:
