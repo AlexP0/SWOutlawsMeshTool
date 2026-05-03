@@ -5,7 +5,7 @@ bl_info = {
     "name": "Star Wars Outlaws Mesh Tool",
     "author": "AlexPo",
     "location": "Scene Properties > Star Wars: Outlaws Mesh Tool Panel",
-    "version": (0, 0, 5),
+    "version": (0, 0, 6),
     "blender": (5, 0, 0),
     "description": "This addon imports/exports skeletal meshes\n from Star Wars Outlaws's .mmb files",
     "category": "Import-Export"
