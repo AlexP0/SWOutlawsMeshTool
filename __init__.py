@@ -200,6 +200,15 @@ class BytePacker:
                             +str(v))
         return pack('<B', i)
     @staticmethod
+    def int8_norm(v):
+        if -1.001 <= v <= 1.001:
+            i = max(-255, min(int(v * ((2 ** 7) - 1)), 255))
+        else:
+            raise Exception("Couldn't normalize value as uint8Norm, "
+                            "it wasn't between -1.0 and 1.0. Unknown max value."
+                            + str(v))
+        return pack('<b', i)
+    @staticmethod
     def int16(v):
         return pack('<h', v)
     @staticmethod
@@ -218,10 +227,11 @@ class BytePacker:
             raise Exception("Couldn't normalize value as int16Norm, it wasn't between -1.0 and 1.0. Unknown max value.")
         return pack('<h', v)
     @staticmethod
-    def uint16_norm(v):
+    def uint16_norm(v,exp = 16, max_value = 0xFFFF):
         if 0.0 < v < 1.0:
-            i = v * (2 ** 16) - 1
-            i = int(i)
+            # i = v * (2 ** 16) - 1
+            # i = int(i)
+            i = max(0,min(int(v * ((2 ** exp)-1)),max_value))
         else:
             raise Exception("Couldn't normalize value as uint16Norm, it wasn't between -1.0 and 1.0. Unknown max value.")
         return pack('<H', i)
@@ -277,7 +287,10 @@ class BytePacker:
         out_matrix = b''
         for i in range(4):
             for c in range(4):
-                out_matrix += bp.float(matrix[c][i])
+                if abs(matrix[c][i]) < 0.0001:
+                    out_matrix += bp.float(0.0)
+                else:
+                    out_matrix += bp.float(matrix[c][i])
         return out_matrix
 
 br = ByteReader
@@ -392,6 +405,9 @@ class SkeletalMeshAsset(Asset):
                 f.write(bp.uint32(self.data_offset))
                 f.write(bp.uint32(self.data_size))
                 f.write(bp.float(self.lod_screen_size))
+            def write_data_offset(self,f):
+                f.seek(self.start_offset + 24)
+                f.write(bp.uint32(self.data_offset))
 
             def gather_extra_bytes(self,f):
                 offset = f.tell()
@@ -490,33 +506,44 @@ class SkeletalMeshAsset(Asset):
                 else:
                     pos_length = 12
                 weight_type = self.parent_mesh.vertex_weight_type
-                weight_count = 8
-                if weight_type == 0:
-                    weight_count = int((stride - pos_length) / 2)
-                elif weight_type == 1:
-                    weight_count = 12
+                index_type = self.parent_mesh.vertex_weight_index_type
+                weight_count = self.parent_mesh.weight_count
+
                 for v in range(self.vertex_count):
                     vertex_stride_start = f.tell()
                     f.seek(pos_length,1)
                     weights = []
                     iw = {}
                     for w in range(weight_count):
-                        weight = br.uint8_norm(f)
+                        if weight_type == 'uint8_norm':
+                            weight = br.uint8_norm(f)
+                        elif weight_type == 'uint16_norm':
+                            weight = br.uint16_norm(f)
+                        else:
+                            weight = br.uint8_norm(f)
                         if weight > 0.0:
                             weights.append(weight)
 
                     for i in range(weight_count):
                         if i < len(weights):
-                            if weight_type == 1:
+                            if index_type == 'uint16':
                                 iw[br.uint16(f)] = weights[i]
+                            elif index_type == 'uint8':
+                                iw[br.uint8(f)] = weights[i]
                             else:
                                 iw[br.uint8(f)] = weights[i]
                         else:
-                            if weight_type == 1:
+                            if index_type == 'uint16':
                                 f.seek(2,1)
                             else:
                                 f.seek(1,1)
                     f.seek(vertex_stride_start + stride)
+                    if v == 0:
+                        print("Weight vertex info vvvvvvvvvvvvvv")
+                        print(f.tell())
+                        print(vertex_stride_start)
+                        print(weight_type, weight_count, index_type)
+                        print(iw)
 
                     bone_weights.append(iw)
                 return bone_weights
@@ -530,6 +557,7 @@ class SkeletalMeshAsset(Asset):
                 tris = []
                 f = raw_mesh_file
                 f.seek(self.face_block_offset)
+                print(f.tell())
                 tris_count = int(self.index_count/3)
                 if self.vertex_count == self.index_count:
                     index_count = int(self.size_a / 4)
@@ -544,7 +572,7 @@ class SkeletalMeshAsset(Asset):
                 return tris
 
             def get_normals_size(self):
-                if self.parent_mesh.normal_type == 0:
+                if self.parent_mesh.normal_type == 'int8_norm':
                     return 8
                 else:
                     return 28
@@ -557,14 +585,14 @@ class SkeletalMeshAsset(Asset):
                 v = Vector((0.0,0.0,1.0))
                 for i in range(self.vertex_count):
                     stride_start = f.tell()
-                    if self.parent_mesh.normal_type == 0:
+                    if self.parent_mesh.normal_type == "int8_norm":
                         x = br.int8_norm(f) *-1
                         y = br.int8_norm(f)
                         z = br.int8_norm(f)
                         w = br.int8(f)
                         v = Vector((x*w, y*w, z*w)).normalized()
                         v.negate()  # TODO not sure about this
-                    elif self.parent_mesh.normal_type == 1:
+                    elif self.parent_mesh.normal_type == "float":
                         x = br.float(f) *-1
                         y = br.float(f)
                         z = br.float(f)
@@ -582,7 +610,9 @@ class SkeletalMeshAsset(Asset):
                 uvs = []
                 color_count = self.parent_mesh.color_count
                 f = raw_mesh_file
+                print(f'Load Info Type: {self.lod_info_type}')
                 if self.lod_info_type == 12:
+
                     stride = self.parent_mesh.vertex_stride
                     f.seek(self.vertex_data_offset_a)
                     for i in range(self.vertex_count):
@@ -600,8 +630,12 @@ class SkeletalMeshAsset(Asset):
                         f.seek(self.get_normals_size(), 1) #skip normals
                         f.seek(4 * color_count, 1) #skip color
                         f.seek(index * 4, 1)  # skip previous uv
-                        u = br.int16_norm(f)
-                        v = br.int16_norm(f)
+                        if index == 1 and stride - (f.tell() - stride_start) == 8: #TODO this is guesswork
+                            u = br.float(f)
+                            v = br.float(f)
+                        else:
+                            u = br.int16_norm(f)
+                            v = br.int16_norm(f)
                         f.seek(stride_start + stride)
                         uvs.append((u,v))
                 return uvs
@@ -671,9 +705,10 @@ class SkeletalMeshAsset(Asset):
         def __init__(self,parent_sk_mesh,index = 0):
             self.parent_sk_mesh:SkeletalMeshAsset = parent_sk_mesh
             if self.parent_sk_mesh.bone_count > 0xFF:
-                self.vertex_weight_type = 1  # 1: uint16_norm
+                self.vertex_weight_index_type = 'uint16' # 1: uint16
             else:
-                self.vertex_weight_type = 0  # 0: uint8_norm
+                self.vertex_weight_index_type = 'uint8'  # 0: uint8
+            self.vertex_weight_type = 'uint8_norm'
             self.index = index
             self.name = ""
             self.lod_count_offset = 0
@@ -681,6 +716,7 @@ class SkeletalMeshAsset(Asset):
             self.binding_count = 0
             self.lod_count = 0
             self.lods = []
+            self.weight_count = 0
             self.vertex_stride = 0
             self.normals_stride = 0
 
@@ -690,8 +726,8 @@ class SkeletalMeshAsset(Asset):
 
             self.color_count = 0
             self.uv_count = 0
-            self.normal_type = 0 # 0:int8_norm 1:floats
-            self.position_type = 0 # 0:int16_norm 1:floats
+            self.normal_type = 'float' # 0:int8_norm 1:float
+            self.position_type = 0 # 0:int16_norm 1:float
             self.end_bytes = None # bytes from the end of the last LOD to the end of the mesh section.
             self.mesh_file = None # BytesIO of reversed ordered LOD mesh data.
 
@@ -702,8 +738,12 @@ class SkeletalMeshAsset(Asset):
             f.seek(1, 1)
             x_count = br.uint16(f)
             f.seek(4 * x_count, 1)
-            y_count = br.uint16(f)
-            f.seek(4 * y_count, 1)
+            if self.parent_sk_mesh.version != 17:
+                y_count = br.uint16(f)
+                f.seek(4 * y_count, 1)
+            else:
+                y_count = 0
+
             print("Binding Count Offset:", f.tell())
             self.binding_count_offset = f.tell()
             self.binding_count = br.uint16(f)
@@ -713,13 +753,17 @@ class SkeletalMeshAsset(Asset):
                 self.parent_sk_mesh.bones[bone_index].set_mesh_matrix(matrix)
                 self.mesh_bones[bone_index] = matrix
                 self.real_bone_indices_to_mesh_bones[bone_index] = b
-                print(bone_index, " = ", b)
-            f.seek(2, 1)
+                # print(bone_index, " = ", b)
+            if self.parent_sk_mesh.version != 17:
+                f.seek(2, 1)
+            else:
+                f.seek(1,1)
             flag_1, flag_2, flag_3 = 0, 0, 0
-            if y_count > 0:
-                flag_1 = br.uint8(f)
-                flag_2 = br.uint8(f)
-                flag_3 = br.uint8(f)
+            if self.parent_sk_mesh.version != 17:
+                if y_count > 0:
+                    flag_1 = br.uint8(f)
+                    flag_2 = br.uint8(f)
+                    flag_3 = br.uint8(f)
             lod_info_type = br.uint16(f)
             self.lod_count_offset = f.tell()
             print("Lod Count Offset: ",self.lod_count_offset)
@@ -735,7 +779,7 @@ class SkeletalMeshAsset(Asset):
             f.seek(4*self.uv_count,1)
             self.color_count = br.uint8(f)
             f.seek(4*self.color_count,1)
-            unk = br.uint32(f)
+            self.weight_count = br.uint32(f)
             count_c = br.uint8(f)
             f.seek(4*count_c,1)
             if lod_info_type == 12:
@@ -765,29 +809,59 @@ class SkeletalMeshAsset(Asset):
                     l.gather_extra_bytes(f)
 
             # guessing the type of normal data int8 or floats
-            if self.normals_stride - (4 * self.uv_count) - (4 * self.color_count) > 8:
-                self.normal_type = 1
+            possible_normal_length = self.normals_stride - (4 * self.uv_count) - (4 * self.color_count)
+            if possible_normal_length > 16:
+                self.normal_type = "float"
             else:
-                self.normal_type = 0
+                self.normal_type = "int8_norm"
 
             # guessing the type of vertex position data int16 or floats
-            if self.vertex_stride - 16 == 8 or self.vertex_stride - 8 == 8:
+
+            if self.vertex_stride - 16 == 8 or self.vertex_stride - 8 == 8 or (self.vertex_stride == 12 and self.weight_count == 1):
                 self.position_type = 0 #int16
+                position_length = 8
             elif self.vertex_stride - 16 == 12 or self.vertex_stride - 8 == 12:
                 self.position_type = 1 #float
+                position_length = 12
             else:
                 self.position_type = 1 #float
+                position_length = 12
+            # guessing weight type
+            index_size = {'uint8':1,'uint16':2}
+            weight_length = self.vertex_stride - position_length - (self.weight_count * index_size[self.vertex_weight_index_type])
+            print("Weight length : ",weight_length, self.weight_count, weight_length/self.weight_count)
+            if weight_length / self.weight_count == 2:
+                self.vertex_weight_type = 'uint16_norm'
+            elif weight_length / self.weight_count == 3:
+                self.vertex_weight_type = 'uint16_norm'
+            else:
+                self.vertex_weight_type = 'uint8_norm'
+
+
+
             print(f'\nName = {self.name}'
                   f'\nVertex Stride: {self.vertex_stride}'
                   f'\nNormals Stride: {self.normals_stride}'
+                  f'\nNormals Type: {self.normal_type}'
+                  f'\nPossible Normal Length: {possible_normal_length}'
                   f'\nUV Count: {self.uv_count}'
-                  f'\nColor Count: {self.color_count}')
+                  f'\nColor Count: {self.color_count}'
+                  f'\nWeight Count: {self.weight_count}'
+                  f'\nWeight Type: {self.vertex_weight_type}'
+                  f'\nIndex Type: {self.vertex_weight_index_type}')
         def write(self, f):
             f.seek(self.lod_count_offset)
             lod_count = br.uint8(f)
             f.seek(4, 1)
             for l in range(self.lod_count):
                 self.lods[l].write(f)
+        def write_remap_bindings(self, f, index_remap):
+            f.seek(self.binding_count_offset + 2) #+2 to skip count
+            for i in range(self.binding_count):
+                f.seek(64,1)
+                old_index = br.uint16(f)
+                f.seek(-2,1)
+                f.write(bp.uint16(index_remap[old_index]))
 
         def extract_mesh_file(self,f):
             """
@@ -817,6 +891,7 @@ class SkeletalMeshAsset(Asset):
         self.name = ""
         self.bone_count = 0
         self.bones = []
+        self.mesh_count_offset = 0
         self.mesh_count = 0
         self.meshes = []
         self.end_bytes = None # bytes at the end of the meshes sections
@@ -827,6 +902,7 @@ class SkeletalMeshAsset(Asset):
         for b in range(self.bone_count):
             self.bones.append(self.Bone(f))
         print("Mesh Count Offset:", f.tell())
+        self.mesh_count_offset = f.tell()
         self.mesh_count = br.uint32(f)
         for m in range(self.mesh_count):
             mesh = self.Mesh(self,index = m)
@@ -914,7 +990,6 @@ class BlenderMeshImporter:
             for v_index in tris:
                 tv = bm.verts[v_index]
                 face_vertices.append(tv)
-            # print(tris)
             bm_face = bm.faces.new(face_vertices)
             bm_face.normal_flip() #this is required because the *-1 on x vertex co flips the mesh normals
         bm.to_mesh(obj_data)
@@ -948,12 +1023,9 @@ class BlenderMeshImporter:
         # Import Bone Weights
         weights = lod.get_bone_weights(raw_mesh_file)
         mesh_bones = list(mesh.mesh_bones.keys())
-        print(mesh_bones)
         for bone in skeletal_mesh.bones:
             obj.vertex_groups.new(name=bone.name)
         for v_index in range(lod.vertex_count):
-            if v_index == 2200:
-                print(weights[v_index])
             v_bone_weights = weights[v_index]
             for bone_index in v_bone_weights.keys():
                 if bone_index < len(mesh_bones):
@@ -961,6 +1033,7 @@ class BlenderMeshImporter:
                     bone_name = skeletal_mesh.bones[real_bone_index].name
                     obj.vertex_groups[bone_name].add([v_index],v_bone_weights[bone_index], "ADD")
                 else:
+                    pass
                     print("Bone index out of MeshBone range : ", bone_index)
         return obj
 
@@ -995,7 +1068,7 @@ class BlenderMeshImporter:
             #     print(b.matrix)
             # bone.matrix = b.matrix
         scale_matrix = Matrix().Scale(-1.0, 4, Vector((1.0, 0.0, 0.0)))
-        _armature.transform(scale_matrix)
+        # _armature.transform(scale_matrix)
         bpy.ops.object.mode_set(mode='OBJECT')
         return _obj
     @staticmethod
@@ -1055,7 +1128,7 @@ class BlenderMeshExporter:
                 for v in range(lod.vertex_count):
                     lod.write_vertex_position(f, pos=data.vertices[v].co * Vector((-1.0,1.0,1.0)), scale=2)
     @staticmethod
-    def get_vertex_blend_indices(vertex):
+    def get_vertex_blend_indices(vertex,normalize_max = 1.0):
         '''
         Returns a dictionary of the vertex normalized, sorted and truncated 8 weights.
         '''
@@ -1074,7 +1147,7 @@ class BlenderMeshExporter:
         # print(total_weight)
         if total_weight == 0:
             raise Exception("Vertex {v} has no weight".format(v=vertex.index))
-        normalizer = 1/total_weight
+        normalizer = normalize_max/total_weight
         for gw in group_weights:
             group_weights[gw] *= normalizer
 
@@ -1116,39 +1189,72 @@ class BlenderMeshExporter:
                 pos_length = 12
             else:
                 pos_length = 12
-            weight_count = int((stride - pos_length) / 2)
+            weight_count = mesh.weight_count
             print(stride, weight_count,mesh.position_type)
             mesh_bones = list(mesh.mesh_bones.keys())
             for v in bm.verts:
+                stride_start = f.tell()
                 # Write Coordinate
                 if mesh.position_type == 0:
+                    pos_length = 8
                     scale = BME.get_mesh_normalize_scale(obj)
                     for co in BME.convert_coordinate(v.co):
                         f.write(bp.int16_norm(co/scale))
                     f.write(bp.int16(scale))
                 if mesh.position_type == 1:
+                    pos_length = 12
                     for co in BME.convert_coordinate(v.co):
                         f.write(bp.float(co))
                 vertex = data.vertices[v.index]
 
-                weights = BME.get_vertex_blend_indices(vertex)
+                if mesh.vertex_weight_type == 'uint16_norm':
+                    weights = BME.get_vertex_blend_indices(vertex, normalize_max = 1.0)
+                else:
+                    weights = BME.get_vertex_blend_indices(vertex)
                 bi = b''
                 # Write weights
+                if mesh.weight_count == 1:
+                    zero_byte_count = stride - pos_length
+                    f.write(b'\x00'*zero_byte_count)
+                    continue
                 int_weights = []
                 for w in weights:
-                    int_weights.append(max(0,min(int(w[1] * ((2 ** 8)-1)),255)))
+                    if mesh.vertex_weight_type == 'uint8_norm':
+                        int_weights.append(max(0,min(int(w[1] * ((2 ** 8)-1)),0xFF)))
+                    elif mesh.vertex_weight_type == 'uint16_norm':
+                        x = w[1]
+                        int_weights.append(max(0,min(int(x * 32767),32767)))
                 weight_sum = sum(int_weights)
-                extra_weight = 0xFF - weight_sum
+                if v.index == 0:
+                    print("Weight sum ",weight_sum)
+                if mesh.vertex_weight_type == 'uint16_norm':
+                    extra_weight = 32767 - weight_sum
+                    print('Extra weight' ,extra_weight, weight_sum, 32767)
+                else:
+                    extra_weight = 0xFF - weight_sum
                 for i in range(weight_count):
                     if i > len(weights)-1:
-                        f.write(bp.uint8_norm(0))
+                        if mesh.vertex_weight_type == 'uint8_norm':
+                            f.write(bp.uint8_norm(0))
+                        elif mesh.vertex_weight_type == 'uint16_norm':
+                            f.write(bp.int16_norm(0))
+                        else:
+                            f.write(bp.uint8_norm(0))
                     else:
-                        f.write(bp.uint8(int_weights[i] + extra_weight))
+                        if mesh.vertex_weight_type == 'uint16_norm':
+                            f.write(bp.uint16(int_weights[i] + extra_weight))
+                        else:
+                            f.write(bp.uint8(int_weights[i] + extra_weight))
                         extra_weight = 0
                 # Write indices
                 for i in range(weight_count):
                     if i > len(weights)-1:
-                        f.write(bp.uint8(0))
+                        if mesh.vertex_weight_index_type == 'uint8':
+                            f.write(bp.uint8(0))
+                        elif mesh.vertex_weight_index_type == 'uint16':
+                            f.write(bp.uint16(0))
+                        else:
+                            f.write(bp.uint8(0))
                     else:
                         if mesh.real_bone_indices_to_mesh_bones.__contains__(weights[i][0]):
                             # print(weights[i], weights[i][0], mesh.real_bone_indices_to_mesh_bones)
@@ -1158,7 +1264,15 @@ class BlenderMeshExporter:
                             mesh.real_bone_indices_to_mesh_bones[weights[i][0]] = mesh.real_bone_indices_to_mesh_bones.__len__()
                             extra_bones.append(weights[i][0])
                             mesh_bone_index = mesh.real_bone_indices_to_mesh_bones[weights[i][0]]
-                        f.write(bp.uint8(mesh_bone_index))
+                        if mesh.vertex_weight_index_type == 'uint16':
+                            f.write(bp.uint16(mesh_bone_index))
+                        else:
+                            f.write(bp.uint8(mesh_bone_index))
+                # Pad end of vertex with 00 to meet stride length.
+                if f.tell() - stride_start < stride:
+                    zero_byte_count = stride_start + stride - f.tell()
+                    f.write(b'\x00'*zero_byte_count)
+                    continue
             return extra_bones
     @staticmethod
     def write_normals(file, mesh:SkeletalMeshAsset.Mesh, lod_index = 0):
@@ -1166,6 +1280,7 @@ class BlenderMeshExporter:
         obj = BME.find_object_by_name(mesh.name+f"_LOD{lod_index}")
         lod:SkeletalMeshAsset.Mesh.LOD = mesh.lods[lod_index]
         if obj:
+            stride = mesh.normals_stride
             data = obj.data
             bm = bmesh.new()
             bm.from_mesh(data)
@@ -1192,17 +1307,30 @@ class BlenderMeshExporter:
                     flip = 1.0
                 NTB[l.vertex_index] = (l.normal,l.tangent,flip)
             for v in data.vertices:
+                stride_start = f.tell()
                 # Write Normals
                 normal = NTB[v.index][0] #TODO support other normal format
-                f.write(bp.float(normal[0]*-1))
-                f.write(bp.float(normal[1]))
-                f.write(bp.float(normal[2]))
                 tangent = NTB[v.index][1]
-                f.write(bp.float(tangent[0]*-1))
-                f.write(bp.float(tangent[1]))
-                f.write(bp.float(tangent[2]))
                 v_flip = NTB[v.index][2]
-                f.write(bp.float(v_flip))
+                if mesh.normal_type == 'float':
+                    f.write(bp.float(normal[0]*-1))
+                    f.write(bp.float(normal[1]))
+                    f.write(bp.float(normal[2]))
+
+                    f.write(bp.float(tangent[0]*-1))
+                    f.write(bp.float(tangent[1]))
+                    f.write(bp.float(tangent[2]))
+
+                    f.write(bp.float(v_flip))
+                if mesh.normal_type == 'int8_norm':
+                    f.write(bp.int8_norm(normal[0]*-1))
+                    f.write(bp.int8_norm(normal[1]))
+                    f.write(bp.int8_norm(normal[2]))
+                    f.write(bp.uint8(255))
+                    f.write(bp.int8_norm(tangent[0]*-1))
+                    f.write(bp.int8_norm(tangent[1]))
+                    f.write(bp.int8_norm(tangent[2]))
+                    f.write(bp.uint8(127))
 
                 # Write Vertex Color
                 for cl in color_layers:
@@ -1212,9 +1340,13 @@ class BlenderMeshExporter:
                         f.write(bp.uint8_norm(c))
 
                 # Write UVs
-                for uv_map in uv_maps:
-                    for uv in uv_map[v.index]:
-                        f.write(bp.int16_norm(uv))
+                for index, uv_map in enumerate(uv_maps):
+                    if index == 1 and stride - (f.tell() - stride_start) == 8:
+                        for uv in uv_map[v.index]:
+                            f.write(bp.float(uv))
+                    else:
+                        for uv in uv_map[v.index]:
+                            f.write(bp.int16_norm(uv))
             bm.free()
     @staticmethod
     def write_triangles(file, mesh:SkeletalMeshAsset.Mesh, lod_index = 0):
@@ -1309,6 +1441,93 @@ class BlenderMeshExporter:
                 print("Mesh_File data start : ", new_vertex_data_offset_a, "Data Size : ", current_modded_lod.data_size)
         modded_mesh.mesh_file = mesh_file
         return modded_mesh
+    @staticmethod
+    def write_skeleton(armature):
+        print("\nExporting skeleton...")
+        f = io.BytesIO()
+        bones = armature.bones
+        f.write(bp.uint32(len(bones)))
+        for b in bones:
+            matrix = b.matrix_local
+            parent_index = 0xFFFF
+            if b.parent is not None:
+                parent_matrix = bones[b.parent.name].matrix_local
+                matrix = parent_matrix.inverted() @ b.matrix_local
+                parent_index = bones.find(b.parent.name)
+            f.write(bp.uint16(len(b.name)))
+            f.write(b.name.encode())
+            f.write(bp.matrix_4x4(matrix))
+            f.write(bp.uint16(parent_index))
+        return f
+    @staticmethod
+    def append_skeleton(armature):
+        #TODO instead of remap_all_meshes_to_new_skeleton, only add extra bones at the end of the skeleton.
+        # Won't need to remap all mesh bones and vertices, only adjust data_offsets.
+        return
+    @staticmethod
+    def remap_all_meshes_to_new_skeleton(armature_obj):
+        print("Remapping all meshes to new skeleton...")
+        new_armature = armature_obj.data
+        SWOMT = bpy.context.scene.SWOMT
+        file = SWOMT.AssetPath
+        # Get old bone names : bone indices
+        old_bones = {}
+        for i,b in enumerate(asset.bones):
+            old_bones[b.name] = i
+        # Get new bone names : bone indices
+        new_bones = {}
+        for i,b in enumerate(new_armature.bones):
+            new_bones[b.name] = i
+
+        # Print Bone Remap
+        total_name_size = 0
+        for b in new_bones.keys():
+            if old_bones.__contains__(b):
+                print(b, old_bones[b]," -> ", new_bones[b])
+            else:
+                total_name_size += len(b) + 2
+                print(b, new_bones[b], " <--------  NEW BONE")
+
+        # Create Index Remap
+        index_remap = {}
+        for b in old_bones.keys():
+            if new_bones.__contains__(b):
+                index_remap[old_bones[b]] = new_bones[b]
+        # Print Index Remap
+        for ir in index_remap.keys():
+            print(ir, " -> ", index_remap[ir])
+        if old_bones.__len__() > new_bones.__len__():
+            raise Exception("Removing bones isn't good idea. Make sure the new skeleton "
+                            "only adds new bones to the old skeleton.")
+        bone_count_diff = new_bones.__len__() - old_bones.__len__()
+        size_diff = bone_count_diff * 66
+        size_diff += total_name_size
+        # For each meshes bone bindings, remap index to new index
+        with open(file, 'rb+') as f:
+            print("Writing new mesh bone bindings...")
+            for m in asset.meshes:
+                m.write_remap_bindings(f, index_remap)
+                for l in m.lods:
+                    # Change all LODs data_offset to add different of skeleton data size.
+                    l.data_offset += size_diff
+                    l.write_data_offset(f)
+        # Create new skeleton data block
+        skeleton_data = BME.write_skeleton(new_armature)
+
+        # Write new file
+        f = io.BytesIO()
+        with open(file,'rb') as source:
+            f.write(source.read(4)) #write mmb.
+            old_size = br.uint32(source)
+            f.write(bp.uint32(old_size + size_diff))
+            f.write(source.read(4)) #write 4 bytes after size
+            f.write(skeleton_data.getbuffer())
+            source_skeleton_size = br.uint32(source)
+            source.seek(asset.mesh_count_offset)
+            f.write(source.read())
+        with open(file, 'wb+') as mmb:
+            mmb.write(f.getbuffer())
+
 
 asset : SkeletalMeshAsset = None
 BMI = BlenderMeshImporter
@@ -1363,6 +1582,17 @@ class AddModAsset(bpy.types.Operator):
             mod_assets.remove(mod_assets.find(SWOMT.AssetPath))
             print("Removed current AssetPath from mod assets.")
         return {'FINISHED'}
+class LoadModAsset(bpy.types.Operator):
+    """Reads data from base .mmb file"""
+    bl_idname = "object.load_mod_asset"
+    bl_label = "Asset Path"
+
+    asset_path: bpy.props.StringProperty(name="Asset Path", subtype="FILE_PATH")
+
+    def execute(self,context):
+        SWOMT = context.scene.SWOMT
+        SWOMT['AssetPath'] = self.asset_path
+        return {'FINISHED'}
 
 
 class ImportLOD(bpy.types.Operator):
@@ -1388,8 +1618,8 @@ class ImportLOD(bpy.types.Operator):
                               mesh=mesh,
                               lod_index=lod.index)
         armature = BMI.find_or_create_skeleton(sk_mesh)
-        BMI.parent_obj_to_armature(obj,armature)
-        BMI.rotate_model(obj,armature)
+        # BMI.parent_obj_to_armature(obj,armature)
+        # BMI.rotate_model(obj,armature)
         return {'FINISHED'}
 class DeleteLOD(bpy.types.Operator):
     """Deletes the given LOD."""
@@ -1436,13 +1666,12 @@ class ExportLOD(bpy.types.Operator):
         return asset is not None
 
     def execute(self,context):
-        # mod_file = BME.copy_mmb_file()
-        # BME.overwrite_vertex_positions(file=mod_file,
-        #                                skeletal_mesh=asset,
-        #                                mesh=asset.meshes[self.mesh_index],
-        #                                lod_index=self.lod_index)
         SWOMT = bpy.context.scene.SWOMT
         file = SWOMT.AssetPath
+
+        # file = file + "Skeleton"
+        # BME.export_skeleton(file,bpy.context.active_object)
+        # return {'FINISHED'}
         mesh = asset.meshes[self.mesh_index]
         lod = mesh.lods[self.lod_index]
         obj = BME.find_object_by_name(mesh.name + f"_LOD{self.lod_index}")
@@ -1451,7 +1680,6 @@ class ExportLOD(bpy.types.Operator):
         print(self.mesh_index, self.lod_index)
         print(mesh.lod_count_offset)
         f = io.BytesIO()
-        # modded_mesh, mesh_file = BME.create_mesh_file(self.mesh_index, self.lod_index)
         modded_asset = SkeletalMeshAsset()
         # Create modded mesh files and mesh data
         for m in asset.meshes:
@@ -1589,6 +1817,22 @@ class OverwriteVertices(bpy.types.Operator):
                                        mesh=asset.meshes[self.mesh_index],
                                        lod_index=self.lod_index)
         return {'FINISHED'}
+class RemapSkeleton(bpy.types.Operator):
+    """Replaces the skeleton of the asset with the selected skeleton."""
+    bl_idname = 'object.remap_skeleton'
+    bl_label = 'Remap Skeleton'
+
+    @classmethod
+    def poll(cls,context):
+        poll = bpy.context.active_object is not None
+        if poll:
+            poll = bpy.context.active_object.type == "ARMATURE"
+        else:
+            poll = False
+        return asset is not None and poll
+    def execute(self,context):
+        BME.remap_all_meshes_to_new_skeleton(bpy.context.active_object)
+        return {'FINISHED'}
 
 class CreateBackup(bpy.types.Operator):
     """Create a backup of the current file."""
@@ -1653,6 +1897,28 @@ class SWOMTPanel(bpy.types.Panel):
         row = layout.row()
         row.operator("object.create_backup")
         row.operator("object.revert_to_backup")
+        row = layout.row()
+        row.operator("object.remap_skeleton")
+
+class AssetPanel(bpy.types.Panel):
+    """Creates a Panel in the Scene Properties window"""
+    bl_label = "Assets"
+    bl_idname = "OBJECT_PT_assetpanel"
+    bl_space_type = "PROPERTIES"
+    bl_region_type = "WINDOW"
+    bl_context = "scene"
+    bl_parent_id = "OBJECT_PT_swomtpanel"
+
+    def draw(self,context):
+        SWOMT = context.scene.SWOMT
+
+        layout = self.layout
+        row = layout.row()
+        row.label(text= "Mod Assets")
+        for a in SWOMT.ModAssets:
+            row = layout.row()
+            asset_button = row.operator("object.load_mod_asset", text=a.AssetPath)
+            asset_button.asset_path = a.AssetPath
 
 class MeshPanel(bpy.types.Panel):
     bl_label = "Mesh"
@@ -1695,6 +1961,8 @@ class MeshPanel(bpy.types.Panel):
 classes=[SWOMT_ModAsset,
          SWOMTSettings,
          SWOMTPanel,
+         LoadModAsset,
+         AssetPanel,
          MeshPanel,
          LoadMMB,
          ImportLOD,
@@ -1703,7 +1971,8 @@ classes=[SWOMT_ModAsset,
          RevertToBackup,
          DeleteLOD,
          AddModAsset,
-         OverwriteVertices]
+         OverwriteVertices,
+         RemapSkeleton]
 
 def register():
     for c in classes:
