@@ -5,9 +5,9 @@ bl_info = {
     "name": "Star Wars Outlaws Mesh Tool",
     "author": "AlexPo",
     "location": "Scene Properties > Star Wars: Outlaws Mesh Tool Panel",
-    "version": (0, 0, 6),
+    "version": (0, 0, 7),
     "blender": (5, 0, 0),
-    "description": "This addon imports/exports skeletal meshes\n from Star Wars Outlaws's .mmb files",
+    "description": "Imports/exports skeletal meshes\n from Star Wars Outlaws's .mmb files",
     "category": "Import-Export"
     }
 
@@ -126,8 +126,8 @@ class ByteReader:
         return v
     @staticmethod
     def uint16_norm(f):
-        int16 = unpack('<H', f.read(2))[0]
-        return int16 / 2 ** 16
+        uint16 = unpack('<H', f.read(2))[0]
+        return uint16 / ((2 ** 16) - 1)
     @staticmethod
     def uint8_norm(f):
         uint8 = unpack('<B', f.read(1))[0]
@@ -227,13 +227,11 @@ class BytePacker:
             raise Exception("Couldn't normalize value as int16Norm, it wasn't between -1.0 and 1.0. Unknown max value.")
         return pack('<h', v)
     @staticmethod
-    def uint16_norm(v,exp = 16, max_value = 0xFFFF):
-        if 0.0 < v < 1.0:
-            # i = v * (2 ** 16) - 1
-            # i = int(i)
-            i = max(0,min(int(v * ((2 ** exp)-1)),max_value))
+    def uint16_norm(v, exp=16, max_value=0xFFFF):
+        if 0.0 <= v <= 1.0:
+            i = max(0, min(int(round(v * ((2 ** exp) - 1))), max_value))
         else:
-            raise Exception("Couldn't normalize value as uint16Norm, it wasn't between -1.0 and 1.0. Unknown max value.")
+            raise Exception("Couldn't normalize value as uint16Norm, it wasn't between 0.0 and 1.0. Unknown max value. " + str(v))
         return pack('<H', i)
     @staticmethod
     def float16(v):
@@ -487,8 +485,14 @@ class SkeletalMeshAsset(Asset):
                 return vertices
 
             def get_bone_weights(self, raw_mesh_file):
+                """
+                Read bone weights while preserving fixed slot alignment.
+
+                The vertex buffer may physically store more weight/index slots than the
+                declared logical weight count. Always read the full physical layout so
+                weight bytes and index bytes remain aligned.
+                """
                 bone_weights = []
-                pos_length = 0  # size of vertex position in stride
                 if self.lod_info_type == 12:
                     stride = self.local_vertex_stride
                     SWOMT = bpy.context.scene.SWOMT
@@ -499,55 +503,45 @@ class SkeletalMeshAsset(Asset):
                     stride = self.parent_mesh.vertex_stride
                     f = raw_mesh_file
                     f.seek(self.vertex_data_offset_a)
-                if self.parent_mesh.position_type == 0:
-                    pos_length = 8
-                elif self.parent_mesh.position_type == 1:
-                    pos_length = 12
-                else:
-                    pos_length = 12
-                weight_type = self.parent_mesh.vertex_weight_type
-                index_type = self.parent_mesh.vertex_weight_index_type
-                weight_count = self.parent_mesh.weight_count
+
+                pos_length = self.parent_mesh.get_vertex_position_length()
+                layout = self.parent_mesh.get_vertex_weight_storage_layout()
+                weight_type = layout['weight_type']
+                index_type = layout['index_type']
+                storage_weight_count = layout['count']
 
                 for v in range(self.vertex_count):
                     vertex_stride_start = f.tell()
-                    f.seek(pos_length,1)
-                    weights = []
-                    iw = {}
-                    for w in range(weight_count):
-                        if weight_type == 'uint8_norm':
-                            weight = br.uint8_norm(f)
-                        elif weight_type == 'uint16_norm':
-                            weight = br.uint16_norm(f)
-                        else:
-                            weight = br.uint8_norm(f)
-                        if weight > 0.0:
-                            weights.append(weight)
+                    f.seek(pos_length, 1)
 
-                    for i in range(weight_count):
-                        if i < len(weights):
-                            if index_type == 'uint16':
-                                iw[br.uint16(f)] = weights[i]
-                            elif index_type == 'uint8':
-                                iw[br.uint8(f)] = weights[i]
-                            else:
-                                iw[br.uint8(f)] = weights[i]
+                    weights = []
+                    for w in range(storage_weight_count):
+                        if weight_type == 'uint16_norm':
+                            weights.append(br.uint16_norm(f))
                         else:
-                            if index_type == 'uint16':
-                                f.seek(2,1)
-                            else:
-                                f.seek(1,1)
+                            weights.append(br.uint8_norm(f))
+
+                    indices = []
+                    for i in range(storage_weight_count):
+                        if index_type == 'uint16':
+                            indices.append(br.uint16(f))
+                        else:
+                            indices.append(br.uint8(f))
+
+                    iw = {}
+                    for i in range(storage_weight_count):
+                        if weights[i] > 0.0:
+                            iw[indices[i]] = weights[i]
+
                     f.seek(vertex_stride_start + stride)
                     if v == 0:
                         print("Weight vertex info vvvvvvvvvvvvvv")
                         print(f.tell())
                         print(vertex_stride_start)
-                        print(weight_type, weight_count, index_type)
+                        print(weight_type, storage_weight_count, index_type)
                         print(iw)
-
                     bone_weights.append(iw)
                 return bone_weights
-
             def get_triangles(self,raw_mesh_file):
                 """
                 Seeks to Lod.face_block_offset and reads all triangle indices.
@@ -731,6 +725,55 @@ class SkeletalMeshAsset(Asset):
             self.end_bytes = None # bytes from the end of the last LOD to the end of the mesh section.
             self.mesh_file = None # BytesIO of reversed ordered LOD mesh data.
 
+        def get_vertex_position_length(self):
+            if self.position_type == 0:
+                return 8
+            elif self.position_type == 1:
+                return 12
+            return 12
+
+        def get_vertex_weight_storage_layout(self):
+            """
+            Return the physical weight/index layout implied by the vertex stride.
+
+            Some meshes declare a logical weight count that is smaller than the
+            physical number of weight/index slots stored in the vertex buffer. Some
+            other meshes are ambiguous enough that the old heuristic guessed
+            uint16_norm weights even though the physical stride matches packed
+            uint8_norm weights plus uint8 indices.
+            """
+            index_type = self.vertex_weight_index_type
+            index_unit = 2 if index_type == 'uint16' else 1
+            pos_length = self.get_vertex_position_length()
+            remaining = self.vertex_stride - pos_length
+
+            # If the parser guessed uint16 weights from an odd 3-bytes-per-declared-slot
+            # layout, also test the common packed uint8 weights + indices layout.
+            alt_slot_size = 1 + index_unit
+            if self.weight_count > 1 and remaining > 0 and alt_slot_size > 0 and remaining % alt_slot_size == 0:
+                alt_capacity = remaining // alt_slot_size
+                if self.vertex_weight_type == 'uint16_norm' and alt_capacity >= self.weight_count and alt_capacity <= 8:
+                    print(f"Detected packed uint8 weight layout for {self.name}: declared/guessed {self.weight_count}x{self.vertex_weight_type}+{index_type}, stride fits {alt_capacity}xuint8_norm+{index_type}.")
+                    return {'count': alt_capacity, 'weight_type': 'uint8_norm', 'index_type': index_type, 'weight_unit': 1, 'index_unit': index_unit}
+
+            weight_type = self.vertex_weight_type
+            weight_unit = 2 if weight_type == 'uint16_norm' else 1
+            slot_size = weight_unit + index_unit
+            count = self.weight_count
+            if self.weight_count > 1 and remaining > 0 and slot_size > 0 and remaining % slot_size == 0:
+                capacity = remaining // slot_size
+                if capacity >= self.weight_count and capacity <= 8:
+                    if capacity != self.weight_count:
+                        print(f"Detected extra physical weight slots for {self.name}: declared weight_count={self.weight_count}, stride stores {capacity} slots.")
+                    count = capacity
+            return {'count': count, 'weight_type': weight_type, 'index_type': index_type, 'weight_unit': weight_unit, 'index_unit': index_unit}
+
+        def get_vertex_weight_storage_count(self):
+            return self.get_vertex_weight_storage_layout()['count']
+
+        def get_vertex_weight_storage_type(self):
+            return self.get_vertex_weight_storage_layout()['weight_type']
+
         def parse(self, f):
             print("Mesh Start Offset:", f.tell())
             self.name = br.name(f)
@@ -829,16 +872,20 @@ class SkeletalMeshAsset(Asset):
             # guessing weight type
             index_size = {'uint8':1,'uint16':2}
             weight_length = self.vertex_stride - position_length - (self.weight_count * index_size[self.vertex_weight_index_type])
-            print("Weight length : ",weight_length, self.weight_count, weight_length/self.weight_count)
-            if weight_length / self.weight_count == 2:
+            print("Weight length : ", weight_length, self.weight_count, (weight_length / self.weight_count if self.weight_count else 0))
+            if self.weight_count == 0:
+                print("WARNING: Weight count is 0; keeping default uint8_norm weight type.")
+            elif weight_length / self.weight_count == 2:
                 self.vertex_weight_type = 'uint16_norm'
             elif weight_length / self.weight_count == 3:
+                print("WARNING: unusual 3-byte-per-weight-slot layout guessed as uint16_norm; packed uint8 physical layout will also be tested.")
                 self.vertex_weight_type = 'uint16_norm'
             else:
                 self.vertex_weight_type = 'uint8_norm'
 
 
 
+            storage_layout = self.get_vertex_weight_storage_layout()
             print(f'\nName = {self.name}'
                   f'\nVertex Stride: {self.vertex_stride}'
                   f'\nNormals Stride: {self.normals_stride}'
@@ -847,7 +894,9 @@ class SkeletalMeshAsset(Asset):
                   f'\nUV Count: {self.uv_count}'
                   f'\nColor Count: {self.color_count}'
                   f'\nWeight Count: {self.weight_count}'
+                  f'\nPhysical Weight Storage Count: {storage_layout["count"]}'
                   f'\nWeight Type: {self.vertex_weight_type}'
+                  f'\nPhysical Weight Storage Type: {storage_layout["weight_type"]}'
                   f'\nIndex Type: {self.vertex_weight_index_type}')
         def write(self, f):
             f.seek(self.lod_count_offset)
@@ -971,29 +1020,30 @@ class BlenderMeshImporter:
         collection = BMI.find_or_create_collection(skeletal_mesh.name)
         collection.objects.link(obj)
 
-        # Create BMesh
-        bm = bmesh.new()
-        bm.from_mesh(obj_data)
-
         lod = mesh.lods[lod_index]
-        # Import vertices
+        # Import vertices/faces. Use Mesh.from_pydata for the initial construction
+        # because some valid game meshes contain duplicate triangle records and
+        # bmesh.faces.new rejects duplicate faces.
         verts = lod.get_vertex_positions(raw_mesh_file)
-        for v in verts:
-            bmv = bm.verts.new()
-            v_co = (v[0]*-1,v[1],v[2])
-            bmv.co = v_co
-        bm.verts.ensure_lookup_table()
-        # Import triangles
+        vertex_coords = [(v[0] * -1, v[1], v[2]) for v in verts]
         triangles = lod.get_triangles(raw_mesh_file)
+        faces = []
+        seen_faces = set()
+        duplicate_face_count = 0
         for tris in triangles:
-            face_vertices = []
-            for v_index in tris:
-                tv = bm.verts[v_index]
-                face_vertices.append(tv)
-            bm_face = bm.faces.new(face_vertices)
-            bm_face.normal_flip() #this is required because the *-1 on x vertex co flips the mesh normals
-        bm.to_mesh(obj_data)
-        bm.free()
+            # Reverse winding to compensate for mirrored X coordinates, matching the
+            # old bm_face.normal_flip() behaviour.
+            face = (tris[2], tris[1], tris[0])
+            key = tuple(sorted(face))
+            if key in seen_faces:
+                duplicate_face_count += 1
+            else:
+                seen_faces.add(key)
+            faces.append(face)
+        if duplicate_face_count > 0:
+            print(f"{mesh.name}_LOD{lod_index} contains {duplicate_face_count} duplicate triangle(s); preserving them.")
+        obj_data.from_pydata(vertex_coords, [], faces)
+        obj_data.update(calc_edges=False)
         bm = bmesh.new()
         bm.from_mesh(obj_data)
         bm.faces.ensure_lookup_table()
@@ -1190,7 +1240,10 @@ class BlenderMeshExporter:
             else:
                 pos_length = 12
             weight_count = mesh.weight_count
-            print(stride, weight_count,mesh.position_type)
+            storage_layout = mesh.get_vertex_weight_storage_layout()
+            storage_weight_count = storage_layout['count']
+            storage_weight_type = storage_layout['weight_type']
+            print(stride, weight_count, storage_weight_count, storage_weight_type, mesh.position_type)
             mesh_bones = list(mesh.mesh_bones.keys())
             for v in bm.verts:
                 stride_start = f.tell()
@@ -1219,35 +1272,36 @@ class BlenderMeshExporter:
                     continue
                 int_weights = []
                 for w in weights:
-                    if mesh.vertex_weight_type == 'uint8_norm':
-                        int_weights.append(max(0,min(int(w[1] * ((2 ** 8)-1)),0xFF)))
-                    elif mesh.vertex_weight_type == 'uint16_norm':
+                    if storage_weight_type == 'uint16_norm':
                         x = w[1]
-                        int_weights.append(max(0,min(int(x * 32767),32767)))
+                        int_weights.append(max(0, min(int(round(x * 0xFFFF)), 0xFFFF)))
+                    else:
+                        int_weights.append(max(0, min(int(round(w[1] * 0xFF)), 0xFF)))
                 weight_sum = sum(int_weights)
                 if v.index == 0:
-                    print("Weight sum ",weight_sum)
-                if mesh.vertex_weight_type == 'uint16_norm':
-                    extra_weight = 32767 - weight_sum
-                    print('Extra weight' ,extra_weight, weight_sum, 32767)
+                    print("Weight sum ", weight_sum)
+                if storage_weight_type == 'uint16_norm':
+                    extra_weight = 0xFFFF - weight_sum
+                    print('Extra weight', extra_weight, weight_sum, 0xFFFF)
                 else:
                     extra_weight = 0xFF - weight_sum
-                for i in range(weight_count):
+                if extra_weight < 0:
+                    print("WARNING: normalized integer weights exceeded target range; clamping extra_weight to 0", extra_weight)
+                    extra_weight = 0
+                for i in range(storage_weight_count):
                     if i > len(weights)-1:
-                        if mesh.vertex_weight_type == 'uint8_norm':
-                            f.write(bp.uint8_norm(0))
-                        elif mesh.vertex_weight_type == 'uint16_norm':
-                            f.write(bp.int16_norm(0))
+                        if storage_weight_type == 'uint16_norm':
+                            f.write(bp.uint16(0))
                         else:
-                            f.write(bp.uint8_norm(0))
+                            f.write(bp.uint8(0))
                     else:
-                        if mesh.vertex_weight_type == 'uint16_norm':
+                        if storage_weight_type == 'uint16_norm':
                             f.write(bp.uint16(int_weights[i] + extra_weight))
                         else:
                             f.write(bp.uint8(int_weights[i] + extra_weight))
                         extra_weight = 0
                 # Write indices
-                for i in range(weight_count):
+                for i in range(storage_weight_count):
                     if i > len(weights)-1:
                         if mesh.vertex_weight_index_type == 'uint8':
                             f.write(bp.uint8(0))
@@ -1591,7 +1645,7 @@ class LoadModAsset(bpy.types.Operator):
 
     def execute(self,context):
         SWOMT = context.scene.SWOMT
-        SWOMT['AssetPath'] = self.asset_path
+        SWOMT.AssetPath = self.asset_path
         return {'FINISHED'}
 
 
@@ -1612,7 +1666,7 @@ class ImportLOD(bpy.types.Operator):
         mesh = sk_mesh.meshes[self.mesh_index]
         lod = mesh.lods[self.lod_index]
         SWOMT = context.scene.SWOMT
-        merged_mmb = get_merged_mmb(SWOMT["AssetPath"])
+        merged_mmb = get_merged_mmb(SWOMT.AssetPath)
         obj = BMI.import_mesh(merged_mmb,
                               skeletal_mesh=sk_mesh,
                               mesh=mesh,
@@ -1639,7 +1693,7 @@ class DeleteLOD(bpy.types.Operator):
         lod = mesh.lods[self.lod_index]
         SWOMT = context.scene.SWOMT
 
-        with open(SWOMT["AssetPath"], 'rb+') as f:
+        with open(SWOMT.AssetPath, 'rb+') as f:
 
             if lod.index == 0:
                 f.seek(lod.start_offset)
@@ -1842,11 +1896,11 @@ class CreateBackup(bpy.types.Operator):
     @classmethod
     def poll(cls,context):
         SWOMT = context.scene.SWOMT
-        return SWOMT["AssetPath"] is not None
+        return bool(getattr(SWOMT, "AssetPath", ""))
 
     def execute(self,context):
         SWOMT = context.scene.SWOMT
-        asset_path = SWOMT["AssetPath"]
+        asset_path = SWOMT.AssetPath
         shutil.copy(asset_path, asset_path+".bak")
 
         return {'FINISHED'}
@@ -1858,12 +1912,12 @@ class RevertToBackup(bpy.types.Operator):
     @classmethod
     def poll(cls,context):
         SWOMT = context.scene.SWOMT
-        asset_path = SWOMT["AssetPath"]
-        return os.path.isfile(asset_path+".bak")
+        asset_path = getattr(SWOMT, "AssetPath", "")
+        return bool(asset_path) and os.path.isfile(asset_path + ".bak")
 
     def execute(self,context):
         SWOMT = context.scene.SWOMT
-        asset_path = SWOMT["AssetPath"]
+        asset_path = SWOMT.AssetPath
         if os.path.isfile(asset_path+".bak"):
             shutil.copy(asset_path+".bak", asset_path)
 
@@ -1981,8 +2035,10 @@ def register():
 
 
 def unregister():
-    for c in classes:
+    for c in reversed(classes):
         bpy.utils.unregister_class(c)
+    if hasattr(bpy.types.Scene, "SWOMT"):
+        del bpy.types.Scene.SWOMT
 
 if __name__ == "__main__":
     register()
