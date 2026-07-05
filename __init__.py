@@ -5,7 +5,7 @@ bl_info = {
     "name": "Star Wars Outlaws Mesh Tool",
     "author": "AlexPo",
     "location": "Scene Properties > Star Wars: Outlaws Mesh Tool Panel",
-    "version": (0, 0, 7),
+    "version": (0, 0, 8),
     "blender": (5, 0, 0),
     "description": "Imports/exports skeletal meshes\n from Star Wars Outlaws's .mmb files",
     "category": "Import-Export"
@@ -510,6 +510,16 @@ class SkeletalMeshAsset(Asset):
                 index_type = layout['index_type']
                 storage_weight_count = layout['count']
 
+                if self.parent_mesh.is_rigid_single_binding_float3_layout():
+                    print(
+                        f"Rigid single-binding weight layout detected for "
+                        f"{self.parent_mesh.name}_LOD{self.index}; "
+                        f"assigning all vertices to mesh bone 0 with weight 1.0."
+                    )
+                    for v in range(self.vertex_count):
+                        bone_weights.append({0: 1.0})
+                    return bone_weights
+
                 for v in range(self.vertex_count):
                     vertex_stride_start = f.tell()
                     f.seek(pos_length, 1)
@@ -732,6 +742,11 @@ class SkeletalMeshAsset(Asset):
                 return 12
             return 12
 
+        def is_rigid_single_binding_float3_layout(self):
+            """Return True for rigid accessory meshes using float3 positions in a 16-byte stride."""
+            return (self.vertex_stride == 16 and self.weight_count == 1 and
+                    self.binding_count == 1 and self.normal_type == "float")
+
         def get_vertex_weight_storage_layout(self):
             """
             Return the physical weight/index layout implied by the vertex stride.
@@ -742,6 +757,15 @@ class SkeletalMeshAsset(Asset):
             uint16_norm weights even though the physical stride matches packed
             uint8_norm weights plus uint8 indices.
             """
+            if self.is_rigid_single_binding_float3_layout():
+                return {
+                    'count': 1,
+                    'weight_type': 'rigid_single_binding',
+                    'index_type': self.vertex_weight_index_type,
+                    'weight_unit': 0,
+                    'index_unit': 0,
+                }
+
             index_type = self.vertex_weight_index_type
             index_unit = 2 if index_type == 'uint16' else 1
             pos_length = self.get_vertex_position_length()
@@ -775,8 +799,12 @@ class SkeletalMeshAsset(Asset):
             return self.get_vertex_weight_storage_layout()['weight_type']
 
         def parse(self, f):
-            print("Mesh Start Offset:", f.tell())
+            mesh_start_offset = f.tell()
             self.name = br.name(f)
+            print("\n" + "-" * 72)
+            print(f"LOAD MESH START: {self.name}  (mesh_index={self.index})")
+            print("-" * 72)
+            print("Mesh Start Offset:", mesh_start_offset)
             f.seek(48, 1)  # some kind of matrix
             f.seek(1, 1)
             x_count = br.uint16(f)
@@ -869,12 +897,28 @@ class SkeletalMeshAsset(Asset):
             else:
                 self.position_type = 1 #float
                 position_length = 12
+            # Rigid accessory/metal meshes can use a compact 16-byte vertex layout:
+            # float3 position + 4 trailing bytes. With weight_count=1 and a single
+            # mesh binding, stride-only heuristics can misclassify this as
+            # int16_norm+scale and collapse the mesh in Blender.
+            if self.is_rigid_single_binding_float3_layout():
+                if self.position_type != 1:
+                    print(f"Detected rigid float3 position layout for {self.name}: "
+                          f"stride=16, weight_count=1, binding_count=1, normals=float.")
+                self.position_type = 1
+                position_length = 12
+
             # guessing weight type
             index_size = {'uint8':1,'uint16':2}
             weight_length = self.vertex_stride - position_length - (self.weight_count * index_size[self.vertex_weight_index_type])
             print("Weight length : ", weight_length, self.weight_count, (weight_length / self.weight_count if self.weight_count else 0))
             if self.weight_count == 0:
                 print("WARNING: Weight count is 0; keeping default uint8_norm weight type.")
+            elif self.is_rigid_single_binding_float3_layout():
+                # Rigid single-binding float3 meshes do not use meaningful per-vertex
+                # skin weights. Keep a harmless default and suppress the ambiguous
+                # 3-byte weight-layout warning for this known rigid/accessory layout.
+                self.vertex_weight_type = 'uint8_norm'
             elif weight_length / self.weight_count == 2:
                 self.vertex_weight_type = 'uint16_norm'
             elif weight_length / self.weight_count == 3:
@@ -898,6 +942,9 @@ class SkeletalMeshAsset(Asset):
                   f'\nWeight Type: {self.vertex_weight_type}'
                   f'\nPhysical Weight Storage Type: {storage_layout["weight_type"]}'
                   f'\nIndex Type: {self.vertex_weight_index_type}')
+            print("-" * 72)
+            print(f"LOAD MESH END: {self.name}")
+            print("-" * 72)
         def write(self, f):
             f.seek(self.lod_count_offset)
             lod_count = br.uint8(f)
@@ -1021,6 +1068,18 @@ class BlenderMeshImporter:
         collection.objects.link(obj)
 
         lod = mesh.lods[lod_index]
+        print("\n" + "=" * 72)
+        print(f"IMPORT START: {mesh.name}_LOD{lod_index}  (mesh_index={mesh.index}, lod_index={lod_index})")
+        print("=" * 72)
+        print(f"Vertex Count: {lod.vertex_count}")
+        print(f"Index Count: {lod.index_count}")
+        print(f"Vertex Stride: {mesh.vertex_stride}")
+        print(f"Normals Stride: {mesh.normals_stride}")
+        print(f"Weight Count: {mesh.weight_count}")
+        storage_layout = mesh.get_vertex_weight_storage_layout()
+        print(f"Physical Weight Storage Count: {storage_layout['count']}")
+        print(f"Physical Weight Storage Type: {storage_layout['weight_type']}")
+        print("=" * 72)
         # Import vertices/faces. Use Mesh.from_pydata for the initial construction
         # because some valid game meshes contain duplicate triangle records and
         # bmesh.faces.new rejects duplicate faces.
@@ -1085,6 +1144,9 @@ class BlenderMeshImporter:
                 else:
                     pass
                     print("Bone index out of MeshBone range : ", bone_index)
+        print("=" * 72)
+        print(f"IMPORT END: {mesh.name}_LOD{lod_index}")
+        print("=" * 72)
         return obj
 
     @staticmethod
