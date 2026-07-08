@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.0.8
+
+### Fixed
+
+- Fixed import of rigid/accessory meshes that use a compact 16-byte vertex layout with `float3` positions and 4 trailing bytes.
+  - Detected layout:
+    ```text
+    vertex_stride == 16
+    weight_count == 1
+    binding_count == 1
+    normal_type == float
+    ```
+  - These meshes are now treated as:
+    ```text
+    offset 00-11: float3 position
+    offset 12-15: trailing/unknown bytes
+    rigid binding: mesh-local bone 0, weight 1.0
+    ```
+- Fixed rigid/accessory meshes importing as an unusable dot/blob in Blender due to being misclassified as `int16_norm + scale` position layouts.
+- Fixed noisy and misleading `Bone index out of MeshBone range` messages for rigid single-binding meshes by no longer reading arbitrary non-weight vertex bytes as bone indices.
+- Suppressed misleading `uint16_norm` / 3-byte-per-weight-slot warnings for known rigid single-binding float3 layouts.
+
+### Changed
+
+- Added clearer console output separators for mesh Load and Import operations.
+- Load output now starts each mesh block with the mesh name and mesh index before offset/stride details.
+- Import output now prints a clear header/footer and key mesh/LOD layout information before import processing.
+- Rigid single-binding layouts now report their physical weight storage type as `rigid_single_binding`.
+
+### Tested
+
+The following rigid/accessory meshes were verified to import correctly and round-trip with no-change export in-game:
+
+- `metal_mesh`
+- `wirepouch_mesh`
+- `led1_mesh`
+- `led2_mesh`
+- `screen_mesh`
+
 ## 0.0.7
 
 ### Fixed
@@ -18,6 +57,15 @@
 
 - Mesh load output now reports physical weight storage details in addition to the declared weight count.
 
+### Tested
+
+The following observed round-trip failures were used to validate the fixes:
+
+- `shoes_mesh`: declared 6 weights, physically stored 8 `uint8_norm` weight/index slots.
+- `nails_mesh`: guessed as 2 `uint16_norm` weights, physically stored 4 `uint8_norm` weight/index slots.
+- `pants_mesh`: duplicate triangle import case.
+- `body_mesh`: regression test.
+
 ## 0.0.6
 
-- Upstream baseline version before these compatibility fixes.
+- Upstream baseline version before the compatibility fixes above.
