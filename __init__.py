@@ -484,6 +484,7 @@ class SkeletalMeshAsset(Asset):
                     vertices.append(pos)
                 return vertices
 
+
             def get_bone_weights(self, raw_mesh_file):
                 """
                 Read bone weights while preserving fixed slot alignment.
@@ -838,6 +839,31 @@ class SkeletalMeshAsset(Asset):
             pos_length = self.get_vertex_position_length()
             remaining = self.vertex_stride - pos_length
 
+            # Some meshes use uint8 mesh-local bone indices even when the full
+            # skeleton has more than 255 bones. If the declared uint16 index layout
+            # cannot physically fit in the vertex stride, fall back to packed
+            # uint8_norm weights + uint8 indices and derive the physical slot count
+            # from the stride. Example: chain_mesh, stride=20, pos_len=12,
+            # declared weight_count=3 -> remaining=8 bytes, which cannot fit
+            # 3x uint8 weights + 3x uint16 indices (=9 bytes), but fits
+            # 4x uint8 weights + 4x uint8 indices exactly.
+            if index_type == 'uint16' and self.weight_count > 0 and remaining > 0:
+                declared_uint16_size = (self.weight_count * 1) + (self.weight_count * 2)
+                uint8_slot_size = 2  # uint8_norm weight + uint8 mesh-local bone index
+                if declared_uint16_size > remaining and remaining % uint8_slot_size == 0:
+                    uint8_capacity = remaining // uint8_slot_size
+                    if uint8_capacity >= self.weight_count and uint8_capacity <= 8:
+                        print(f"Detected uint8 mesh-local index layout for {self.name}: "
+                              f"declared index_type=uint16 cannot fit stride, "
+                              f"using {uint8_capacity}xuint8_norm+uint8 slots.")
+                        return {
+                            'count': uint8_capacity,
+                            'weight_type': 'uint8_norm',
+                            'index_type': 'uint8',
+                            'weight_unit': 1,
+                            'index_unit': 1,
+                        }
+
             # If the parser guessed uint16 weights from an odd 3-bytes-per-declared-slot
             # layout, also test the common packed uint8 weights + indices layout.
             alt_slot_size = 1 + index_unit
@@ -1148,6 +1174,7 @@ class BlenderMeshImporter:
         print(f"Physical Weight Storage Type: {storage_layout['weight_type']}")
         print("=" * 72)
 
+
         # Very small meshes, especially *_CLOTH_RENDER meshes, are often proxy/helper
         # or render marker meshes rather than normal editable character/clothing meshes.
         if lod.vertex_count <= 3 and lod.index_count <= 3:
@@ -1399,7 +1426,8 @@ class BlenderMeshExporter:
             storage_layout = mesh.get_vertex_weight_storage_layout()
             storage_weight_count = storage_layout['count']
             storage_weight_type = storage_layout['weight_type']
-            print(stride, weight_count, storage_weight_count, storage_weight_type, mesh.position_type)
+            storage_weight_index_type = storage_layout['index_type']
+            print(stride, weight_count, storage_weight_count, storage_weight_type, storage_weight_index_type, mesh.position_type)
             mesh_bones = list(mesh.mesh_bones.keys())
             for v in bm.verts:
                 stride_start = f.tell()
@@ -1459,9 +1487,9 @@ class BlenderMeshExporter:
                 # Write indices
                 for i in range(storage_weight_count):
                     if i > len(weights)-1:
-                        if mesh.vertex_weight_index_type == 'uint8':
+                        if storage_weight_index_type == 'uint8':
                             f.write(bp.uint8(0))
-                        elif mesh.vertex_weight_index_type == 'uint16':
+                        elif storage_weight_index_type == 'uint16':
                             f.write(bp.uint16(0))
                         else:
                             f.write(bp.uint8(0))
@@ -1474,12 +1502,19 @@ class BlenderMeshExporter:
                             mesh.real_bone_indices_to_mesh_bones[weights[i][0]] = mesh.real_bone_indices_to_mesh_bones.__len__()
                             extra_bones.append(weights[i][0])
                             mesh_bone_index = mesh.real_bone_indices_to_mesh_bones[weights[i][0]]
-                        if mesh.vertex_weight_index_type == 'uint16':
+                        if storage_weight_index_type == 'uint16':
                             f.write(bp.uint16(mesh_bone_index))
                         else:
                             f.write(bp.uint8(mesh_bone_index))
                 # Pad end of vertex with 00 to meet stride length.
-                if f.tell() - stride_start < stride:
+                written_vertex_bytes = f.tell() - stride_start
+                if written_vertex_bytes > stride:
+                    raise Exception(
+                        f"{mesh.name}_LOD{lod_index} wrote past vertex stride: "
+                        f"wrote {written_vertex_bytes} bytes, stride is {stride}. "
+                        f"storage layout={storage_weight_count}x{storage_weight_type}+{storage_weight_index_type}"
+                    )
+                if written_vertex_bytes < stride:
                     zero_byte_count = stride_start + stride - f.tell()
                     f.write(b'\x00'*zero_byte_count)
                     continue
