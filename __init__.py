@@ -5,7 +5,7 @@ bl_info = {
     "name": "Star Wars Outlaws Mesh Tool",
     "author": "AlexPo",
     "location": "Scene Properties > Star Wars: Outlaws Mesh Tool Panel",
-    "version": (0, 0, 8),
+    "version": (0, 0, 9),
     "blender": (5, 0, 0),
     "description": "Imports/exports skeletal meshes\n from Star Wars Outlaws's .mmb files",
     "category": "Import-Export"
@@ -553,28 +553,95 @@ class SkeletalMeshAsset(Asset):
                     bone_weights.append(iw)
                 return bone_weights
             def get_triangles(self,raw_mesh_file):
-                """
-                Seeks to Lod.face_block_offset and reads all triangle indices.
-                :param raw_mesh_file: file that is exported by SkeletalMeshAsset.Mesh.extract_mesh_file()
-                :return: a List of Tuples containing 3 vertex indices to form a triangle.
-                """
+                # Bounds-safe triangle index reader.
                 tris = []
                 f = raw_mesh_file
                 f.seek(self.face_block_offset)
                 print(f.tell())
-                tris_count = int(self.index_count/3)
-                if self.vertex_count == self.index_count:
-                    index_count = int(self.size_a / 4)
-                    print(index_count, self.size_a)
-                    tris_count = int(index_count/3)
-                print("Triangles Count:",tris_count)
-                for i in range(tris_count):
-                        f1 = br.uint16(f)
-                        f2 = br.uint16(f)
-                        f3 = br.uint16(f)
-                        tris.append((f1,f2,f3))
-                return tris
 
+                declared_index_count = self.index_count
+                index_count = declared_index_count
+
+                # In the extracted mesh file, face_block_offset is an offset into
+                # that extracted stream. data_size is not always a reliable end
+                # offset for header-resident/proxy LODs, so only use data_size as
+                # a clamp when it produces a positive amount of face data.
+                available_face_bytes = None
+                available_index_count = None
+                if self.data_size is not None and self.face_block_offset is not None:
+                    candidate_face_bytes = self.data_size - self.face_block_offset
+                    if candidate_face_bytes > 0:
+                        available_face_bytes = candidate_face_bytes
+                        available_index_count = available_face_bytes // 2
+
+                # As a fallback clamp, use the remaining bytes in the extracted
+                # mesh stream. This prevents EOF over-reads while not treating
+                # data_size == face_block_offset as zero available triangle data.
+                try:
+                    stream_size = len(f.getbuffer())
+                except Exception:
+                    old_pos = f.tell()
+                    f.seek(0, 2)
+                    stream_size = f.tell()
+                    f.seek(old_pos)
+                stream_remaining_face_bytes = max(0, stream_size - self.face_block_offset)
+                stream_remaining_index_count = stream_remaining_face_bytes // 2
+
+                # Legacy fallback for meshes where index_count equals vertex_count.
+                # Only use the size_a-derived count if it fits inside known
+                # available face data. This prevents *_CLOTH_RENDER meshes from
+                # over-reading, e.g. index_count=3, size_a=240 -> 60 guessed
+                # indices when only one proxy triangle is declared.
+                if self.vertex_count == self.index_count:
+                    fallback_index_count = int(self.size_a / 4)
+                    print(fallback_index_count, self.size_a)
+                    fits_lod_face_data = (
+                        available_index_count is not None and
+                        fallback_index_count <= available_index_count
+                    )
+                    fits_stream_data = fallback_index_count <= stream_remaining_index_count
+                    use_fallback = (
+                        fallback_index_count > declared_index_count and
+                        fallback_index_count % 3 == 0 and
+                        fits_lod_face_data and fits_stream_data
+                    )
+                    if use_fallback:
+                        print(f"Using size_a-derived triangle index count: {fallback_index_count}")
+                        index_count = fallback_index_count
+                    else:
+                        print(f"Using declared triangle index count: {declared_index_count}")
+
+                # Clamp to LOD-local face bytes only when that number is known
+                # and positive. Always also clamp to remaining stream bytes.
+                if available_index_count is not None and index_count > available_index_count:
+                    print(
+                        f"WARNING: triangle index count {index_count} exceeds "
+                        f"available LOD face data {available_index_count}; clamping."
+                    )
+                    index_count = available_index_count
+                if index_count > stream_remaining_index_count:
+                    print(
+                        f"WARNING: triangle index count {index_count} exceeds "
+                        f"remaining stream data {stream_remaining_index_count}; clamping."
+                    )
+                    index_count = stream_remaining_index_count
+
+                tris_count = int(index_count / 3)
+                print("Triangles Count:", tris_count)
+
+                for i in range(tris_count):
+                    consumed_from_stream = f.tell() - self.face_block_offset
+                    if stream_remaining_face_bytes - consumed_from_stream < 6:
+                        print(
+                            f"WARNING: stopping triangle read early at triangle {i}; "
+                            f"only {stream_remaining_face_bytes - consumed_from_stream} stream bytes remain."
+                        )
+                        break
+                    f1 = br.uint16(f)
+                    f2 = br.uint16(f)
+                    f3 = br.uint16(f)
+                    tris.append((f1,f2,f3))
+                return tris
             def get_normals_size(self):
                 if self.parent_mesh.normal_type == 'int8_norm':
                     return 8
@@ -1080,6 +1147,33 @@ class BlenderMeshImporter:
         print(f"Physical Weight Storage Count: {storage_layout['count']}")
         print(f"Physical Weight Storage Type: {storage_layout['weight_type']}")
         print("=" * 72)
+
+        # Very small meshes, especially *_CLOTH_RENDER meshes, are often proxy/helper
+        # or render marker meshes rather than normal editable character/clothing meshes.
+        if lod.vertex_count <= 3 and lod.index_count <= 3:
+            triangle_count = lod.index_count // 3
+            proxy_kind = "CLOTH_RENDER/proxy" if "CLOTH_RENDER" in mesh.name.upper() else "very small/proxy"
+            warning_lines = [
+                f"{mesh.name}_LOD{lod_index} contains only {lod.vertex_count} vertices and {triangle_count} triangle(s).",
+                f"This appears to be a {proxy_kind} mesh rather than a normal editable mesh.",
+                "Import succeeded, but the visible result may only be a tiny triangle or marker."
+            ]
+            print("WARNING:", " ".join(warning_lines))
+
+            def draw_proxy_mesh_warning(self, context):
+                layout = self.layout
+                for line in warning_lines:
+                    layout.label(text=line)
+
+            try:
+                bpy.context.window_manager.popup_menu(
+                    draw_proxy_mesh_warning,
+                    title="Small/proxy mesh imported",
+                    icon='INFO'
+                )
+            except Exception as exc:
+                print("Could not show small/proxy mesh popup:", exc)
+
         # Import vertices/faces. Use Mesh.from_pydata for the initial construction
         # because some valid game meshes contain duplicate triangle records and
         # bmesh.faces.new rejects duplicate faces.
