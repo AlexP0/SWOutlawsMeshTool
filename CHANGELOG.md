@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.0.9
+
+### Fixed
+
+- Fixed triangle index over-read on tiny/proxy `*_CLOTH_RENDER` meshes.
+  - These meshes can declare `Index Count: 3` but also have a `size_a / 4` fallback value that previously caused the importer to read too many triangles.
+  - The importer now prefers the declared index count unless the fallback is proven to fit available face data.
+- Fixed `struct.error: unpack requires a buffer of 2 bytes` when importing tiny `*_CLOTH_RENDER` proxy meshes.
+
+### Changed
+
+- Added an informational popup when importing extremely small/proxy meshes with only up to 3 vertices and 3 indices.
+- The popup explains that the mesh is likely a proxy/helper/render marker mesh rather than a normal editable character or clothing mesh.
+- The same warning is also printed to the console.
+
+### Tested
+
+- `jacket_CLOTH_RENDER` LODs now import without crashing.
+- The imported result is a tiny triangle, which matches the declared 3-vertex / 3-index proxy mesh data.
+
 ## 0.0.8
 
 ### Fixed
