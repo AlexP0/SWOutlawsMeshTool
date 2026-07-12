@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.0.10
+
+### Fixed
+
+#### Mesh-local uint8 bone index layouts
+
+Some skeletal meshes use mesh-local bone indices stored as `uint8`, even when the
+full skeleton contains more than 255 bones.
+
+The importer previously inferred `uint16` bone indices from the skeleton size,
+which caused certain meshes (for example `chain_mesh`) to be decoded incorrectly,
+producing invalid bone references and unusable imported geometry.
+
+The importer now detects when a declared `uint16` index layout cannot physically
+fit within the vertex stride and automatically falls back to a packed:
+
+- `uint8_norm` weights
+- `uint8` mesh-local bone indices
+
+layout when appropriate.
+
+#### Export round-trip support
+
+The exporter now writes bone indices using the physical storage layout returned by
+`get_vertex_weight_storage_layout()` rather than relying solely on the global mesh
+index type.
+
+This fixes round-trip import/export for meshes using mesh-local `uint8` indices
+and prevents vertex-buffer corruption caused by writing `uint16` indices into
+`uint8` layouts.
+
+#### Vertex stride validation
+
+Added export-time validation to detect vertex-buffer layout mismatches.
+
+The exporter now raises an error if a vertex write exceeds the declared vertex
+stride, preventing silent corruption of subsequent mesh data.
+
 ## 0.0.9
 
 ### Fixed
