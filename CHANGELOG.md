@@ -1,5 +1,23 @@
 # Changelog
 
+## Version 0.0.11
+
+### Added
+- Added import handling for de-indexed type-12 head LODs by merging identical vertex positions into shared Blender topology.
+- Added source vertex index tracking for de-indexed imports using the `SWOMT_source_vertex_index` corner attribute.
+- Added safe in-place vertex overwrite support for external type-12 head LOD vertex buffers.
+
+### Changed
+- De-indexed head LODs now import as editable shared topology instead of isolated triangle-corner vertices.
+- Bone weights are remapped correctly after de-indexing/deduplicating imported head LODs.
+- LODs with raw de-indexed vertex counts are labelled more clearly in the UI.
+
+### Fixed
+- Fixed flat-looking shading on de-indexed head LODs caused by every triangle corner being imported as a separate Blender vertex.
+- Fixed broken vertex overwrite for de-indexed external head LODs by writing positions back in original source vertex-buffer order.
+- Fixed unsafe full export behavior for LODs using external `data_y_offset` vertex data by blocking full export and directing users to **Overwrite Vertices**.
+- Fixed bogus custom normal import for meshes with `normals_stride == 0`.
+
 ## 0.0.10
 
 ### Fixed
