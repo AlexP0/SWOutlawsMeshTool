@@ -5,7 +5,7 @@ bl_info = {
     "name": "Star Wars Outlaws Mesh Tool",
     "author": "AlexPo",
     "location": "Scene Properties > Star Wars: Outlaws Mesh Tool Panel",
-    "version": (0, 0, 9),
+    "version": (0, 0, 11),
     "blender": (5, 0, 0),
     "description": "Imports/exports skeletal meshes\n from Star Wars Outlaws's .mmb files",
     "category": "Import-Export"
@@ -1205,58 +1205,160 @@ class BlenderMeshImporter:
         # because some valid game meshes contain duplicate triangle records and
         # bmesh.faces.new rejects duplicate faces.
         verts = lod.get_vertex_positions(raw_mesh_file)
-        vertex_coords = [(v[0] * -1, v[1], v[2]) for v in verts]
+        source_vertex_coords = [(v[0] * -1, v[1], v[2]) for v in verts]
         triangles = lod.get_triangles(raw_mesh_file)
+
+        # Some type-12 head LODs are de-indexed triangle lists:
+        # vertex_count == index_count == triangle_count * 3. Such meshes import as
+        # one Blender vertex per triangle corner, which prevents real smooth shading.
+        # For Blender editing, merge identical positions into shared topology, but
+        # keep source-index mappings so UVs/custom normals can still be assigned per
+        # original triangle corner.
+        dedupe_deindexed_vertices = False
+        if lod.vertex_count == lod.index_count and len(triangles) * 3 == lod.index_count:
+            unique_position_count = len({
+                (round(co[0], 6), round(co[1], 6), round(co[2], 6))
+                for co in source_vertex_coords
+            })
+            if unique_position_count < len(source_vertex_coords):
+                dedupe_deindexed_vertices = True
+                print(
+                    f"{mesh.name}_LOD{lod_index} appears to be de-indexed "
+                    f"({len(source_vertex_coords)} vertices, {unique_position_count} unique positions); "
+                    "merging identical positions for Blender topology."
+                )
+
+        vertex_coords = []
+        source_to_import_vertex = [None] * len(source_vertex_coords)
+        import_vertex_to_source = []
+        if dedupe_deindexed_vertices:
+            position_to_import_vertex = {}
+            for source_index, co in enumerate(source_vertex_coords):
+                key = (round(co[0], 6), round(co[1], 6), round(co[2], 6))
+                import_index = position_to_import_vertex.get(key)
+                if import_index is None:
+                    import_index = len(vertex_coords)
+                    position_to_import_vertex[key] = import_index
+                    vertex_coords.append(co)
+                    import_vertex_to_source.append(source_index)
+                source_to_import_vertex[source_index] = import_index
+        else:
+            vertex_coords = source_vertex_coords
+            source_to_import_vertex = list(range(len(source_vertex_coords)))
+            import_vertex_to_source = list(range(len(source_vertex_coords)))
+
         faces = []
+        face_source_indices = []
         seen_faces = set()
         duplicate_face_count = 0
+        dropped_degenerate_count = 0
         for tris in triangles:
             # Reverse winding to compensate for mirrored X coordinates, matching the
             # old bm_face.normal_flip() behaviour.
-            face = (tris[2], tris[1], tris[0])
+            source_face = (tris[2], tris[1], tris[0])
+            face = tuple(source_to_import_vertex[i] for i in source_face)
+            if len(set(face)) < 3:
+                dropped_degenerate_count += 1
+                continue
             key = tuple(sorted(face))
             if key in seen_faces:
                 duplicate_face_count += 1
             else:
                 seen_faces.add(key)
             faces.append(face)
+            face_source_indices.append(source_face)
         if duplicate_face_count > 0:
             print(f"{mesh.name}_LOD{lod_index} contains {duplicate_face_count} duplicate triangle(s); preserving them.")
+        if dropped_degenerate_count > 0:
+            print(f"{mesh.name}_LOD{lod_index} dropped {dropped_degenerate_count} degenerate triangle(s) after vertex deduplication.")
+
         obj_data.from_pydata(vertex_coords, [], faces)
         obj_data.update(calc_edges=False)
+        if dedupe_deindexed_vertices:
+            obj["SWOMT_import_deduped_deindexed"] = True
+            obj["SWOMT_original_vertex_count"] = lod.vertex_count
+            obj["SWOMT_original_index_count"] = lod.index_count
         bm = bmesh.new()
         bm.from_mesh(obj_data)
         bm.faces.ensure_lookup_table()
-        # Import UVs
+
+        # Import UVs. UVs are loop/corner data in Blender, so use the original
+        # source vertex index for each face corner instead of the deduplicated
+        # topology vertex index.
         for uv_index in range(mesh.uv_count):
             uvs = lod.get_uvs(raw_mesh_file,uv_index)
             uv_layer = bm.loops.layers.uv.new(f'UVMap_{uv_index}')
             for finder, face in enumerate(bm.faces):
                 for lindex, loop in enumerate(face.loops):
-                    v_index = loop.vert.index
-                    v_uv = (uvs[v_index][0], 1 - uvs[v_index][1])
+                    source_v_index = face_source_indices[finder][lindex]
+                    v_uv = (uvs[source_v_index][0], 1 - uvs[source_v_index][1])
                     loop[uv_layer].uv = v_uv
 
-        # Import Colors
+        # Import Colors. These are currently stored as vertex colors by the importer;
+        # after deduplication use the first source vertex that produced each imported
+        # topology vertex.
         for color_index in range(mesh.color_count):
             colors = lod.get_color(raw_mesh_file, color_index)
             color_layer = bm.verts.layers.float_color.new(f"Color_{color_index}")
             for v in bm.verts:
-                v[color_layer] = colors[v.index]
+                source_v_index = import_vertex_to_source[v.index]
+                v[color_layer] = colors[source_v_index]
         bm.to_mesh(obj_data)
         bm.free()
         obj_data.update()
 
-        # Import Normals
-        obj_data.normals_split_custom_set_from_vertices(lod.get_normals(raw_mesh_file))
+        # Persist the original source vertex index per Blender face corner. This is
+        # essential for de-indexed head LODs: after identical positions are merged for
+        # Blender editing, the .mmb still expects positions to be overwritten in the
+        # original source vertex-buffer order. Polygon winding/order is not a safe
+        # inverse mapping after edits or degenerate-face filtering.
+        if dedupe_deindexed_vertices:
+            source_index_attr = obj_data.attributes.new(
+                "SWOMT_source_vertex_index",
+                'INT',
+                'CORNER'
+            )
+            for poly in obj_data.polygons:
+                source_face = face_source_indices[poly.index]
+                for local_loop_index, loop_index in enumerate(poly.loop_indices):
+                    source_index_attr.data[loop_index].value = source_face[local_loop_index]
+
+        # Import Normals only when a real normal stream exists. Some type-12 head
+        # meshes report normals_stride == 0; reading those as normals creates bogus
+        # custom normals and prevents Blender from using calculated smooth normals.
+        if mesh.normals_stride > 0:
+            source_normals = lod.get_normals(raw_mesh_file)
+            if dedupe_deindexed_vertices:
+                loop_normals = []
+                for source_face in face_source_indices:
+                    for source_v_index in source_face:
+                        loop_normals.append(source_normals[source_v_index])
+                obj_data.normals_split_custom_set(loop_normals)
+            else:
+                obj_data.normals_split_custom_set_from_vertices(source_normals)
+        else:
+            print(
+                f"Skipping custom normal import for {mesh.name}_LOD{lod_index}: "
+                f"normals_stride={mesh.normals_stride}. Blender will use calculated normals."
+            )
 
         # Import Bone Weights
         weights = lod.get_bone_weights(raw_mesh_file)
         mesh_bones = list(mesh.mesh_bones.keys())
         for bone in skeletal_mesh.bones:
             obj.vertex_groups.new(name=bone.name)
-        for v_index in range(lod.vertex_count):
-            v_bone_weights = weights[v_index]
+
+        # If de-indexed triangle-corner vertices were merged into shared Blender
+        # topology, Blender has fewer vertices than the source vertex buffer. Assign
+        # each imported Blender vertex the weights from the first source vertex that
+        # produced it. Without this remap, the importer tries to assign weights to
+        # source indices that no longer exist in the Blender mesh.
+        if dedupe_deindexed_vertices:
+            imported_weights = [weights[source_index] for source_index in import_vertex_to_source]
+        else:
+            imported_weights = weights
+
+        for v_index, v_bone_weights in enumerate(imported_weights):
             for bone_index in v_bone_weights.keys():
                 if bone_index < len(mesh_bones):
                     real_bone_index = mesh_bones[bone_index] # Convert mesh bone index to skeleton bone index
@@ -1352,14 +1454,63 @@ class BlenderMeshExporter:
         lod:SkeletalMeshAsset.Mesh.LOD = mesh.lods[lod_index]
         if obj:
             data = obj.data
+            if len(data.vertices) == 0 or len(data.polygons) == 0:
+                raise Exception(
+                    f"{obj.name} has no geometry. Delete stale/failed imports with this name "
+                    "or start from a clean scene before overwriting vertices."
+                )
             with open(file,'rb+') as f:
                 if lod.data_y_offset != 0:
                     print("Vertex Data is in mmb file.")
                     f.seek(lod.data_y_offset)
                 else:
                     f.seek(lod.data_offset)
-                for v in range(lod.vertex_count):
-                    lod.write_vertex_position(f, pos=data.vertices[v].co * Vector((-1.0,1.0,1.0)), scale=2)
+
+                if bool(obj.get("SWOMT_import_deduped_deindexed", False)):
+                    source_index_attr = data.attributes.get("SWOMT_source_vertex_index")
+                    if source_index_attr is None:
+                        raise Exception(
+                            f"{obj.name} is marked as a deduped de-indexed LOD, but it is missing "
+                            "the SWOMT_source_vertex_index corner attribute. Re-import the LOD with "
+                            "the current add-on before using Overwrite Vertices."
+                        )
+                    positions_by_source_index = [None] * lod.vertex_count
+                    for poly in data.polygons:
+                        for loop_index in poly.loop_indices:
+                            source_index = source_index_attr.data[loop_index].value
+                            if 0 <= source_index < lod.vertex_count:
+                                vertex_index = data.loops[loop_index].vertex_index
+                                positions_by_source_index[source_index] = data.vertices[vertex_index].co
+                    missing_count = sum(1 for pos in positions_by_source_index if pos is None)
+                    if missing_count:
+                        raise Exception(
+                            f"{obj.name} source-index mapping is incomplete: {missing_count} of "
+                            f"{lod.vertex_count} source vertices are not represented by mesh corners. "
+                            "Re-import from a clean original .mmb before overwriting."
+                        )
+                    print(
+                        f"Overwriting de-indexed vertex buffer for {mesh.name}_LOD{lod_index}: "
+                        f"{lod.vertex_count} source-order triangle-corner positions."
+                    )
+                    for co in positions_by_source_index:
+                        lod.write_vertex_position(
+                            f,
+                            pos=co * Vector((-1.0,1.0,1.0)),
+                            scale=2
+                        )
+                else:
+                    if len(data.vertices) < lod.vertex_count:
+                        raise Exception(
+                            f"{obj.name} has only {len(data.vertices)} Blender vertices, "
+                            f"but LOD expects {lod.vertex_count}."
+                        )
+                    if lod.data_y_offset != 0:
+                        print(
+                            f"Overwriting external vertex buffer for {mesh.name}_LOD{lod_index}: "
+                            f"{lod.vertex_count} vertices."
+                        )
+                    for v in range(lod.vertex_count):
+                        lod.write_vertex_position(f, pos=data.vertices[v].co * Vector((-1.0,1.0,1.0)), scale=2)
     @staticmethod
     def get_vertex_blend_indices(vertex,normalize_max = 1.0):
         '''
@@ -1429,7 +1580,13 @@ class BlenderMeshExporter:
             storage_weight_index_type = storage_layout['index_type']
             print(stride, weight_count, storage_weight_count, storage_weight_type, storage_weight_index_type, mesh.position_type)
             mesh_bones = list(mesh.mesh_bones.keys())
-            for v in bm.verts:
+            export_as_deindexed = bool(obj.get("SWOMT_import_deduped_deindexed", False))
+            if export_as_deindexed:
+                export_vertex_indices = [vi for poly in data.polygons for vi in poly.vertices]
+            else:
+                export_vertex_indices = [v.index for v in bm.verts]
+            for export_vertex_index in export_vertex_indices:
+                v = bm.verts[export_vertex_index]
                 stride_start = f.tell()
                 # Write Coordinate
                 if mesh.position_type == 0:
@@ -1527,45 +1684,68 @@ class BlenderMeshExporter:
         if obj:
             stride = mesh.normals_stride
             data = obj.data
+            if len(data.polygons) == 0:
+                print(f"Skipping normal write for {mesh.name}_LOD{lod_index}: object has no polygons.")
+                return
+            if stride <= 0:
+                print(f"Skipping normal write for {mesh.name}_LOD{lod_index}: normals_stride={stride}.")
+                return
+            if len(data.uv_layers) == 0:
+                print(f"Skipping tangent/normal write for {mesh.name}_LOD{lod_index}: no UV map is present.")
+                return
             bm = bmesh.new()
             bm.from_mesh(data)
             bm.verts.ensure_lookup_table()
             bm.faces.ensure_lookup_table()
-            data.loops.data.calc_tangents()
-            NTB = [((1.0,0.0,0.0),(0.0,1.0,0.0),1.0)] * len(data.vertices)
+            data.loops.data.calc_tangents(uvmap=data.uv_layers.active.name)
+            export_as_deindexed = bool(obj.get("SWOMT_import_deduped_deindexed", False))
             uv_layers = bm.loops.layers.uv.values()
-            uv_maps = []
             color_layers = bm.verts.layers.float_color.keys()
-            for uvl in uv_layers:
-                UVs = [(0.0,0.0)] * len(data.vertices)
-                for bface in bm.faces:
-                    for loop in bface.loops:
-                        u = loop[uvl].uv[0]
-                        v = 1 - loop[uvl].uv[1]
-                        UVs[loop.vert.index] = [u, v]
-                uv_maps.append(UVs)
-
-            for l in data.loops:
-                if l.bitangent_sign == -1:
-                    flip = -1.0
-                else:
-                    flip = 1.0
-                NTB[l.vertex_index] = (l.normal,l.tangent,flip)
-            for v in data.vertices:
+            uv_maps = []
+            if export_as_deindexed:
+                export_loop_indices = []
+                export_vertex_indices = []
+                for poly in data.polygons:
+                    for li, vi in zip(poly.loop_indices, poly.vertices):
+                        export_loop_indices.append(li)
+                        export_vertex_indices.append(vi)
+                for uvl in uv_layers:
+                    UVs = []
+                    for bface in bm.faces:
+                        for loop in bface.loops:
+                            UVs.append([loop[uvl].uv[0], 1 - loop[uvl].uv[1]])
+                    uv_maps.append(UVs)
+            else:
+                NTB = [((1.0,0.0,0.0),(0.0,1.0,0.0),1.0)] * len(data.vertices)
+                for uvl in uv_layers:
+                    UVs = [(0.0,0.0)] * len(data.vertices)
+                    for bface in bm.faces:
+                        for loop in bface.loops:
+                            UVs[loop.vert.index] = [loop[uvl].uv[0], 1 - loop[uvl].uv[1]]
+                    uv_maps.append(UVs)
+                for l in data.loops:
+                    flip = -1.0 if l.bitangent_sign == -1 else 1.0
+                    NTB[l.vertex_index] = (l.normal,l.tangent,flip)
+                export_vertex_indices = [v.index for v in data.vertices]
+                export_loop_indices = None
+            for export_i, vertex_index in enumerate(export_vertex_indices):
                 stride_start = f.tell()
-                # Write Normals
-                normal = NTB[v.index][0] #TODO support other normal format
-                tangent = NTB[v.index][1]
-                v_flip = NTB[v.index][2]
+                if export_as_deindexed:
+                    loop = data.loops[export_loop_indices[export_i]]
+                    normal = loop.normal
+                    tangent = loop.tangent
+                    v_flip = -1.0 if loop.bitangent_sign == -1 else 1.0
+                else:
+                    normal = NTB[vertex_index][0]
+                    tangent = NTB[vertex_index][1]
+                    v_flip = NTB[vertex_index][2]
                 if mesh.normal_type == 'float':
                     f.write(bp.float(normal[0]*-1))
                     f.write(bp.float(normal[1]))
                     f.write(bp.float(normal[2]))
-
                     f.write(bp.float(tangent[0]*-1))
                     f.write(bp.float(tangent[1]))
                     f.write(bp.float(tangent[2]))
-
                     f.write(bp.float(v_flip))
                 if mesh.normal_type == 'int8_norm':
                     f.write(bp.int8_norm(normal[0]*-1))
@@ -1576,21 +1756,18 @@ class BlenderMeshExporter:
                     f.write(bp.int8_norm(tangent[1]))
                     f.write(bp.int8_norm(tangent[2]))
                     f.write(bp.uint8(127))
-
-                # Write Vertex Color
                 for cl in color_layers:
                     color_layer = bm.verts.layers.float_color[cl]
-                    vertex_color = bm.verts[v.index][color_layer]
+                    vertex_color = bm.verts[vertex_index][color_layer]
                     for c in vertex_color:
                         f.write(bp.uint8_norm(c))
-
-                # Write UVs
+                uv_lookup_index = export_i if export_as_deindexed else vertex_index
                 for index, uv_map in enumerate(uv_maps):
                     if index == 1 and stride - (f.tell() - stride_start) == 8:
-                        for uv in uv_map[v.index]:
+                        for uv in uv_map[uv_lookup_index]:
                             f.write(bp.float(uv))
                     else:
-                        for uv in uv_map[v.index]:
+                        for uv in uv_map[uv_lookup_index]:
                             f.write(bp.int16_norm(uv))
             bm.free()
     @staticmethod
@@ -1608,10 +1785,17 @@ class BlenderMeshExporter:
             # for p in data.polygons:
             #     for v in p.vertices:
             #         f.write(bp.uint16(v))
-            for p in data.polygons:
-                f.write(bp.uint16(p.vertices[0]))
-                f.write(bp.uint16(p.vertices[2]))
-                f.write(bp.uint16(p.vertices[1]))
+            if bool(obj.get("SWOMT_import_deduped_deindexed", False)):
+                for face_index, p in enumerate(data.polygons):
+                    base_index = face_index * 3
+                    f.write(bp.uint16(base_index))
+                    f.write(bp.uint16(base_index + 2))
+                    f.write(bp.uint16(base_index + 1))
+            else:
+                for p in data.polygons:
+                    f.write(bp.uint16(p.vertices[0]))
+                    f.write(bp.uint16(p.vertices[2]))
+                    f.write(bp.uint16(p.vertices[1]))
             # f.write(b'\xFA\x7F\xFA\x7F\xFA\x7F\xFA\x7F\xFA\x7F\xFA\x7F')
             bm.free()
     @staticmethod
@@ -1648,10 +1832,27 @@ class BlenderMeshExporter:
                 if lod.index == lod_index:
                     print("Edited LOD")
                     obj = BME.find_object_by_name(mesh.name + f"_LOD{lod_index}")
-                    current_modded_lod.vertex_count = len(obj.data.vertices)
-                    current_modded_lod.index_count = len(obj.data.polygons) * 3
-                    print("New Vertex count: ", len(obj.data.vertices))
-                    print("New indices count: ", len(obj.data.polygons) * 3)
+                    if lod.data_y_offset != 0:
+                        raise Exception(
+                            f"Full Export is disabled for {mesh.name}_LOD{lod_index} because it uses "
+                            "external type-12 vertex data. Use Overwrite Vertices instead."
+                        )
+                    if len(obj.data.vertices) == 0 or len(obj.data.polygons) == 0:
+                        raise Exception(
+                            f"{obj.name} has no geometry. Delete stale/failed imports with this name "
+                            "or start from a clean scene before exporting."
+                        )
+                    if bool(obj.get("SWOMT_import_deduped_deindexed", False)):
+                        # Keep the editable Blender mesh deduped, but write type-12
+                        # de-indexed head LODs back as one vertex per triangle corner.
+                        current_modded_lod.vertex_count = len(obj.data.polygons) * 3
+                        current_modded_lod.index_count = len(obj.data.polygons) * 3
+                        print("Exporting de-indexed LOD layout for compatibility.")
+                    else:
+                        current_modded_lod.vertex_count = len(obj.data.vertices)
+                        current_modded_lod.index_count = len(obj.data.polygons) * 3
+                    print("New Vertex count: ", current_modded_lod.vertex_count)
+                    print("New indices count: ", current_modded_lod.index_count)
                     # Vertices
                     current_modded_lod.vertex_data_offset_a = mesh_file.tell()
                     modded_mesh.extra_bones = BME.write_vertices(mesh_file, mesh, lod_index)
@@ -1920,6 +2121,13 @@ class ExportLOD(bpy.types.Operator):
         mesh = asset.meshes[self.mesh_index]
         lod = mesh.lods[self.lod_index]
         obj = BME.find_object_by_name(mesh.name + f"_LOD{self.lod_index}")
+        if lod.data_y_offset != 0:
+            raise Exception(
+                f"Full Export is disabled for {mesh.name}_LOD{self.lod_index} because it uses "
+                "external type-12 vertex data. Full Export currently rebuilds the normal mesh stream "
+                "but does not relocate/update the external data_y_offset buffer. Use the small "
+                "'Overwrite Vertices' button instead, which preserves the original .mmb layout."
+            )
         print("\n ////////////////////////\n ///////// EXPORT ////////// \n ////////////////////////")
         print(file)
         print(self.mesh_index, self.lod_index)
@@ -2189,7 +2397,11 @@ class MeshPanel(bpy.types.Panel):
                     icon = "CON_SIZELIKE"
                     if l.lod_screen_size == 1.0:
                        icon = "STRIP_COLOR_01"
-                    row.label(text = f"LOD{li} - {l.vertex_count}", icon = icon)
+                    if l.vertex_count == l.index_count and l.index_count > 3 and l.index_count % 3 == 0:
+                        label_text = f"LOD{li} - {l.vertex_count} raw"
+                    else:
+                        label_text = f"LOD{li} - {l.vertex_count}"
+                    row.label(text = label_text, icon = icon)
                     lod_import_button = row.operator("object.import_lod")
                     lod_import_button.lod_index = li
                     lod_import_button.mesh_index = mi
